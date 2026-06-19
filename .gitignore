@@ -1,0 +1,20 @@
+# 환경변수 / 시크릿 (절대 커밋 금지)
+.env
+kis_token_cache.json
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# 실행 산출물
+outputs/
+
+# 신선 OHLCV 캐시 (매 실행 재생성, 커밋 불필요)
+fresh_ohlcv.parquet
+
+# 가상환경 / OS
+venv-timesfm/
+.DS_Store
+
+# 주의: shared_*.parquet 은 재현성 위해 커밋 유지 → .gitignore에 넣지 않는다.
+# (과거 *.parquet 일괄 무시 규칙은 제거함)
