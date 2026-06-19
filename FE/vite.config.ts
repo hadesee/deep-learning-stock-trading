@@ -2,7 +2,7 @@ import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { buildKisDashboard, buildKisStockChart, refreshDashboardSnapshot } from "./server/kisDashboard";
 import { getCandidatesPayload } from "./server/pipelineResults";
-import { runCandidateAnalysis } from "./server/pipelineRunner";
+import { getCandidateAnalysisStatus, startCandidateAnalysis } from "./server/pipelineRunner";
 
 declare const process: {
   cwd: () => string;
@@ -82,7 +82,26 @@ function kisApiPlugin(): Plugin {
 
         return buildKisStockChart(symbol);
       });
-      jsonRoute(server, "/api/candidates/run", "POST", () => runCandidateAnalysis());
+      // The analysis runs for minutes, so the request must not block: POST kicks
+      // off (or re-attaches to) the background job and returns the current status
+      // immediately; GET polls it. Registered before "/api/candidates" so the
+      // prefix match resolves here first.
+      server.middlewares.use("/api/candidates/run", async (request, response) => {
+        const method = (request as { method?: string }).method;
+
+        try {
+          if (method === "POST") {
+            writeJson(response, 200, startCandidateAnalysis());
+          } else if (method === "GET") {
+            writeJson(response, 200, getCandidateAnalysisStatus());
+          } else {
+            writeJson(response, 405, { error: "Method not allowed" });
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "/api/candidates/run request failed.";
+          writeJson(response, 502, { error: message });
+        }
+      });
       jsonRoute(server, "/api/candidates", "GET", () => getCandidatesPayload());
     },
     name: "kis-api",

@@ -22,9 +22,30 @@ function toNumber(value: unknown): number | null {
   return null;
 }
 
+function upProbability(row: PipelineOutputRow): number | null {
+  return toNumber(row.input_row.p_up);
+}
+
+function modelScore(row: PipelineOutputRow): number | null {
+  const pUp = upProbability(row);
+  if (pUp !== null) {
+    return null;
+  }
+
+  return toNumber(row.input_row.ensemble_pred_return) ?? toNumber(row.input_row.lstm_pred_return);
+}
+
+function modelStatus(row: PipelineOutputRow): string {
+  return String(row.input_row.lstm_status ?? row.input_row.prediction_status ?? "UNKNOWN");
+}
+
+function isReadyModelStatus(status: string): boolean {
+  return status.toLowerCase() === "ok";
+}
+
 function normalizeCandidate(row: PipelineOutputRow): Candidate {
-  const predictedReturn =
-    toNumber(row.input_row.ensemble_pred_return) ?? toNumber(row.input_row.lstm_pred_return);
+  const predictedReturn = modelScore(row);
+  const status = modelStatus(row);
 
   return {
     ticker: row.result.ticker,
@@ -34,7 +55,8 @@ function normalizeCandidate(row: PipelineOutputRow): Candidate {
     sentimentScore: row.result.sentiment_score,
     confidence: row.result.confidence,
     predictedReturn,
-    lstmStatus: String(row.input_row.lstm_status ?? "UNKNOWN"),
+    upProbability: upProbability(row),
+    lstmStatus: status,
     summary: row.result.summary,
     positiveFactors: row.result.positive_factors,
     negativeFactors: row.result.negative_factors,
@@ -105,9 +127,11 @@ export function normalizePipelineResults(rows: PipelineOutputRow[]): LandingData
     riskState: deriveRiskState(candidates),
     strategySlots: candidates.filter(
       (candidate) =>
-        candidate.lstmStatus === "OK" &&
+        isReadyModelStatus(candidate.lstmStatus) &&
         candidate.sentimentLabel !== "NEGATIVE" &&
-        (candidate.predictedReturn ?? 0) > 0,
+        (candidate.upProbability !== undefined && candidate.upProbability !== null
+          ? candidate.upProbability >= 0.5
+          : (candidate.predictedReturn ?? 0) > 0),
     ).length,
     averageConfidence: average(candidates.map((candidate) => candidate.confidence)),
     averagePredictedReturn,
@@ -255,8 +279,11 @@ export type CandidateAnalysisRunResult = {
   dashboardUpdated: boolean;
   elapsedMs: number;
   inputJsonPath?: string;
+  outputCsvPath?: string;
   outputJsonPath: string;
   rows: number;
+  /** Stocks the Gemini news step analyzed; 0 when skipped or unavailable. */
+  newsRows?: number;
   status: "completed";
 };
 
@@ -414,13 +441,73 @@ export async function fetchPipelineCandidates(signal?: AbortSignal): Promise<Pip
   return mockPipelineResults;
 }
 
+type CandidateAnalysisStatus = {
+  status: "idle" | "running" | "completed" | "failed";
+  result?: CandidateAnalysisRunResult;
+  error?: string;
+};
+
+/** Gap between status polls while the background analysis is running. */
+const CANDIDATE_ANALYSIS_POLL_MS = 5000;
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * The analysis runs for minutes server-side, far longer than a proxy/tunnel will
+ * keep a single request open (a Cloudflare Tunnel returns 524 at ~100s). So this
+ * kicks off the background job with a short POST, then polls the status endpoint
+ * with quick requests until it completes or fails.
+ */
 export async function runCandidateAnalysis(signal?: AbortSignal): Promise<CandidateAnalysisRunResult> {
-  return postJson<CandidateAnalysisRunResult>(
-    "/api/candidates/run",
-    signal,
-    isLiveApiEnabled() ? API_BASE_URL : "",
-    CANDIDATE_ANALYSIS_TIMEOUT_MS,
-  );
+  const baseUrl = isLiveApiEnabled() ? API_BASE_URL : "";
+
+  // Start (or re-attach to) the background run. Returns immediately.
+  await postJson<CandidateAnalysisStatus>("/api/candidates/run", signal, baseUrl, REQUEST_TIMEOUT_MS);
+
+  const deadline = Date.now() + CANDIDATE_ANALYSIS_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await delay(CANDIDATE_ANALYSIS_POLL_MS, signal);
+
+    const status = await fetchJson<CandidateAnalysisStatus>(
+      "/api/candidates/run",
+      signal,
+      baseUrl,
+      REQUEST_TIMEOUT_MS,
+    );
+
+    if (status.status === "completed" && status.result) {
+      return status.result;
+    }
+
+    if (status.status === "failed") {
+      throw new Error(status.error ?? "AI 후보 분석 실행에 실패했습니다.");
+    }
+
+    if (status.status === "idle") {
+      throw new Error("AI 후보 분석이 시작되지 않았습니다.");
+    }
+  }
+
+  throw new Error("AI 후보 분석 시간이 초과되었습니다.");
 }
 
 /**

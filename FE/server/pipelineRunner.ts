@@ -1,5 +1,5 @@
-import { access } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { access, mkdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { getCandidatesPayload, refreshDashboardAiFieldsFromPipelineOutput } from "./pipelineResults";
 
@@ -11,9 +11,11 @@ declare const process: {
 export type CandidateAnalysisRunResult = {
   dashboardUpdated: boolean;
   elapsedMs: number;
-  inputJsonPath?: string;
+  outputCsvPath?: string;
   outputJsonPath: string;
   rows: number;
+  /** Number of stocks the Gemini news step analyzed; 0 when the step was skipped or failed. */
+  newsRows: number;
   status: "completed";
 };
 
@@ -67,6 +69,10 @@ function optionalNumericArg(args: string[], name: string, value: string | undefi
   }
 }
 
+function truthyEnv(value: string | undefined): boolean {
+  return ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
+}
+
 async function requireExistingFile(path: string, label: string): Promise<void> {
   if (!(await pathExists(path))) {
     throw new Error(`${label} not found: ${path}`);
@@ -74,49 +80,27 @@ async function requireExistingFile(path: string, label: string): Promise<void> {
 }
 
 type PipelineInputs = {
-  featureCount: string;
-  indicatorPath: string;
-  modelPath: string;
+  mainModulePath: string;
+  predictModulePath: string;
+  transformerCkptPath: string;
 };
 
-async function resolvePipelineInputs(root: string, outputDir: string, env: Record<string, string | undefined>): Promise<PipelineInputs> {
-  const indicatorPath = resolve(
-    env.PIPELINE_INDICATOR_PARQUET ??
-      join(root, "step2_kospi200_indicators.parquet"),
-  );
-  const preparedIndicatorPath = resolve(join(outputDir, "step2_kospi200_indicators.parquet"));
-  const v2ModelPath = resolve(join(root, "lstm_stock_model_v2.pth"));
-  const tenFeatureModelPath = resolve(join(root, "lstm_stock_model_10f.pth"));
-  const preparedModelPath = resolve(join(outputDir, "lstm_stock_model_top10.pth"));
-  const modelPath = resolve(
-    env.PIPELINE_LSTM_MODEL ??
-      ((await pathExists(v2ModelPath))
-        ? v2ModelPath
-        : (await pathExists(tenFeatureModelPath))
-          ? tenFeatureModelPath
-          : preparedModelPath),
-  );
-  const featureCount = env.PIPELINE_FEATURE_COUNT ?? (modelPath.includes("10f") ? "10" : "11");
-
-  if (await pathExists(indicatorPath)) {
-    return { featureCount, indicatorPath, modelPath };
-  }
-
-  if (await pathExists(preparedIndicatorPath)) {
-    return { featureCount, indicatorPath: preparedIndicatorPath, modelPath };
-  }
-
-  return { featureCount, indicatorPath, modelPath };
+function resolvePipelineInputs(root: string, env: Record<string, string | undefined>): PipelineInputs {
+  return {
+    mainModulePath: resolve(env.PIPELINE_MAIN_MODULE ?? join(root, "main.py")),
+    predictModulePath: resolve(env.PIPELINE_PREDICT_MODULE ?? join(root, "predict.py")),
+    transformerCkptPath: resolve(env.PIPELINE_TRANSFORMER_CKPT ?? join(root, "transformer_5y.pt")),
+  };
 }
 
 function pipelineInputArgs(inputs: PipelineInputs): string[] {
   return [
-    "--indicator-parquet",
-    inputs.indicatorPath,
-    "--lstm-model",
-    inputs.modelPath,
-    "--feature-count",
-    inputs.featureCount,
+    "--main-module",
+    inputs.mainModulePath,
+    "--transformer-ckpt",
+    inputs.transformerCkptPath,
+    "--predict-module",
+    inputs.predictModulePath,
   ];
 }
 
@@ -125,63 +109,33 @@ function tail(value: string): string {
 }
 
 function pipelineEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
-  return {
+  const next: Record<string, string | undefined> = {
     ...env,
-    APP_KEY: env.APP_KEY ?? env.KIS_APP_KEY ?? env.KIS_MOCK_APP_KEY ?? env.KIS_REAL_APP_KEY,
-    APP_SECRET: env.APP_SECRET ?? env.KIS_APP_SECRET ?? env.KIS_MOCK_APP_SECRET ?? env.KIS_REAL_APP_SECRET,
+    PYTHONIOENCODING: env.PYTHONIOENCODING ?? "utf-8",
+    PYTHONUTF8: env.PYTHONUTF8 ?? "1",
   };
+  const appKey = env.KIS_MOCK_APP_KEY ?? env.KIS_APP_KEY ?? env.APP_KEY ?? env.KIS_REAL_APP_KEY;
+  const appSecret = env.KIS_MOCK_APP_SECRET ?? env.KIS_APP_SECRET ?? env.APP_SECRET ?? env.KIS_REAL_APP_SECRET;
+  const openAiKey = env.OPENAI_API_KEY ?? env.OPEN_AI_KEY ?? env.OPEN_AI;
+
+  if (appKey) {
+    next.APP_KEY = appKey;
+  }
+  if (appSecret) {
+    next.APP_SECRET = appSecret;
+  }
+  if (openAiKey) {
+    next.OPENAI_API_KEY = openAiKey;
+  }
+
+  return next;
 }
 
-async function preparePipelineInputs(
-  python: string,
-  root: string,
-  outputDir: string,
-  inputs: PipelineInputs,
-  env: Record<string, string | undefined>,
-  timeoutMs: number,
-): Promise<PipelineInputs> {
-  const ready = (await pathExists(inputs.indicatorPath)) && (await pathExists(inputs.modelPath));
-  if (ready) {
-    return inputs;
-  }
-
-  if (env.PIPELINE_BOOTSTRAP_MISSING_INPUTS === "false") {
-    await requireExistingFile(inputs.indicatorPath, "Pipeline indicator parquet");
-    await requireExistingFile(inputs.modelPath, "Pipeline LSTM model");
-  }
-
-  const trainScriptPath = join(root, "train_lstm_from_main_top10.py");
-  await requireExistingFile(trainScriptPath, "Pipeline training script");
-
-  const preparedInputs: PipelineInputs = {
-    featureCount: env.PIPELINE_FEATURE_COUNT ?? inputs.featureCount,
-    indicatorPath: resolve(join(outputDir, "step2_kospi200_indicators.parquet")),
-    modelPath: resolve(join(outputDir, "lstm_stock_model_top10.pth")),
-  };
-
-  const args = [
-    trainScriptPath,
-    "--output-dir",
-    outputDir,
-    "--indicator-output",
-    preparedInputs.indicatorPath,
-    "--model-output",
-    preparedInputs.modelPath,
-    "--feature-count",
-    preparedInputs.featureCount,
-  ];
-
-  optionalNumericArg(args, "--top", env.PIPELINE_PREPARE_TOP ?? env.PIPELINE_RUN_TOP);
-  optionalNumericArg(args, "--years", env.PIPELINE_PREPARE_YEARS);
-  optionalNumericArg(args, "--epochs", env.PIPELINE_PREPARE_EPOCHS);
-  optionalNumericArg(args, "--sequence-length", env.PIPELINE_PREPARE_SEQUENCE_LENGTH);
-  optionalNumericArg(args, "--batch-size", env.PIPELINE_PREPARE_BATCH_SIZE);
-
-  await runProcess(python, args, root, pipelineEnv(env), timeoutMs);
-  await requireExistingFile(preparedInputs.indicatorPath, "Prepared indicator parquet");
-  await requireExistingFile(preparedInputs.modelPath, "Prepared LSTM model");
-
-  return preparedInputs;
+async function preparePipelineInputs(inputs: PipelineInputs): Promise<PipelineInputs> {
+  await requireExistingFile(inputs.mainModulePath, "Pipeline main module");
+  await requireExistingFile(inputs.predictModulePath, "Pipeline predict module");
+  await requireExistingFile(inputs.transformerCkptPath, "Pipeline Transformer checkpoint");
+  return inputs;
 }
 
 function runProcess(
@@ -243,56 +197,199 @@ function runProcess(
   });
 }
 
+/** File the Gemini news step writes and {@link pipelineResults} overlays. */
+const NEWS_RESULT_FILE = "news_gemini_result.json";
+
+/**
+ * Whether to run the Gemini news step. Defaults to on so the combined analysis
+ * surfaces news sentiment; set `PIPELINE_RUN_NEWS=false` to skip (e.g. no Gemini
+ * key, or to save API cost). Credentials live in the project-root `.env` that
+ * crolling.py loads itself, so we don't gate on Node seeing the keys.
+ */
+function shouldRunNews(env: Record<string, string | undefined>): boolean {
+  const explicit = (env.PIPELINE_RUN_NEWS ?? "").trim();
+  if (explicit !== "") {
+    return truthyEnv(explicit);
+  }
+  return true;
+}
+
+/**
+ * Spawns crolling.py with the Transformer Top-N CSV as input, writing
+ * `outputs/news_gemini_result.json`. Returns the analyzed-stock count, or 0 when
+ * skipped/failed (best-effort — never throws).
+ */
+async function runNewsStep(
+  python: string,
+  root: string,
+  outputDir: string,
+  inputCsvPath: string,
+  env: Record<string, string | undefined>,
+  timeoutMs: number,
+): Promise<number> {
+  if (!shouldRunNews(env)) {
+    return 0;
+  }
+
+  const newsScript = resolve(env.PIPELINE_NEWS_SCRIPT ?? join(root, "crolling.py"));
+  if (!(await pathExists(newsScript))) {
+    return 0;
+  }
+
+  const newsOutputPath = join(outputDir, NEWS_RESULT_FILE);
+  const args = [newsScript, "--input", inputCsvPath, "--output", newsOutputPath];
+  optionalNumericArg(args, "--days", env.PIPELINE_RUN_NEWS_DAYS);
+  optionalNumericArg(args, "--max-news", env.PIPELINE_RUN_MAX_NEWS);
+
+  try {
+    await runProcess(python, args, root, pipelineEnv(env), timeoutMs);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[pipeline] News step (crolling.py) failed; candidates returned without news: ${message}`);
+    return 0;
+  }
+
+  return countNewsRows(newsOutputPath);
+}
+
+async function countNewsRows(newsOutputPath: string): Promise<number> {
+  try {
+    const parsed = JSON.parse(await readFile(newsOutputPath, "utf8")) as unknown;
+    return parsed && typeof parsed === "object" ? Object.keys(parsed as Record<string, unknown>).length : 0;
+  } catch {
+    return 0;
+  }
+}
+
 async function executeCandidateAnalysis(env = process.env): Promise<CandidateAnalysisRunResult> {
   const startedAt = Date.now();
   const root = projectRoot(env);
   const scriptPath = join(root, "integrated_pipeline.py");
   const outputDir = resolve(env.PIPELINE_OUTPUT_DIR ?? join(root, "outputs"));
-  const outputJsonPath = join(outputDir, "final_stock_lstm_news_llm_result.json");
+  const outputCsvPath = join(outputDir, "step2_final_top10.csv");
+  const outputJsonPath = join(outputDir, "final_stock_transformer_news_llm_result.json");
   const timeoutMs = Number(env.PIPELINE_RUN_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
   const python = await pythonExecutable(root, env);
 
-  if (!(await pathExists(scriptPath))) {
-    throw new Error(`Pipeline script not found: ${scriptPath}`);
-  }
+  await requireExistingFile(scriptPath, "Pipeline script");
+  await mkdir(outputDir, { recursive: true });
 
-  const inputs = await preparePipelineInputs(
-    python,
-    root,
-    outputDir,
-    await resolvePipelineInputs(root, outputDir, env),
-    env,
-    timeoutMs,
-  );
+  const inputs = await preparePipelineInputs(resolvePipelineInputs(root, env));
   const args = [scriptPath, "--output-dir", outputDir, ...pipelineInputArgs(inputs)];
-  const selectedStocksPath = join(outputDir, "selected_top_stocks.csv");
-  if (await pathExists(selectedStocksPath)) {
-    args.push("--selected-stocks-csv", selectedStocksPath);
-  }
-  optionalNumericArg(args, "--top", env.PIPELINE_RUN_TOP);
-  optionalNumericArg(args, "--news-days", env.PIPELINE_RUN_NEWS_DAYS);
-  optionalNumericArg(args, "--max-news", env.PIPELINE_RUN_MAX_NEWS);
-  if (env.PIPELINE_OPENAI_MODEL) {
-    args.push("--openai-model", env.PIPELINE_OPENAI_MODEL);
-  }
+
+  optionalNumericArg(args, "--candidate-pool", env.PIPELINE_CANDIDATE_POOL);
+  optionalNumericArg(args, "--final-max", env.PIPELINE_FINAL_MAX ?? env.PIPELINE_RUN_TOP);
+  optionalNumericArg(args, "--ohlcv-lookback-days", env.PIPELINE_OHLCV_LOOKBACK_DAYS);
+  optionalNumericArg(args, "--supply-window", env.PIPELINE_SUPPLY_WINDOW);
+  optionalNumericArg(args, "--supply-min-positive-days", env.PIPELINE_SUPPLY_MIN_POSITIVE_DAYS);
 
   await runProcess(python, args, root, pipelineEnv(env), timeoutMs);
 
+  // News + Gemini sentiment is a separate best-effort step (crolling.py) that
+  // overlays onto the Transformer candidates. A failure here (missing key, news
+  // outage) must not discard the candidate output, so it's caught and logged.
+  const newsRows = await runNewsStep(python, root, outputDir, outputCsvPath, env, timeoutMs);
+
   const rows = await getCandidatesPayload();
   if (rows.length === 0) {
-    throw new Error(`Pipeline finished, but no candidate rows were written to ${outputJsonPath}.`);
+    throw new Error(`Pipeline finished, but no candidate rows were found in ${outputJsonPath} or ${outputCsvPath}.`);
   }
 
   return {
     dashboardUpdated: await refreshDashboardAiFieldsFromPipelineOutput(),
     elapsedMs: Date.now() - startedAt,
-    inputJsonPath: inputs.indicatorPath,
-    outputJsonPath,
+    outputCsvPath,
+    outputJsonPath: outputCsvPath,
     rows: rows.length,
+    newsRows,
     status: "completed",
   };
 }
 
+/**
+ * Status snapshot returned by `GET /api/candidates/run`. The run is async: a
+ * single HTTP request can't survive the analysis (it takes minutes, and a
+ * Cloudflare Tunnel cuts the origin off at ~100s with a 524). So POST starts the
+ * job in the background and clients poll this status until it settles.
+ */
+export type CandidateAnalysisStatus = {
+  status: "idle" | "running" | "completed" | "failed";
+  startedAt?: number;
+  finishedAt?: number;
+  elapsedMs?: number;
+  result?: CandidateAnalysisRunResult;
+  error?: string;
+};
+
+type RunState =
+  | { status: "idle" }
+  | { status: "running"; startedAt: number }
+  | { status: "completed"; startedAt: number; finishedAt: number; result: CandidateAnalysisRunResult }
+  | { status: "failed"; startedAt: number; finishedAt: number; error: string };
+
+let runState: RunState = { status: "idle" };
+
+export function getCandidateAnalysisStatus(): CandidateAnalysisStatus {
+  switch (runState.status) {
+    case "running":
+      return { status: "running", startedAt: runState.startedAt, elapsedMs: Date.now() - runState.startedAt };
+    case "completed":
+      return {
+        status: "completed",
+        startedAt: runState.startedAt,
+        finishedAt: runState.finishedAt,
+        elapsedMs: runState.finishedAt - runState.startedAt,
+        result: runState.result,
+      };
+    case "failed":
+      return {
+        status: "failed",
+        startedAt: runState.startedAt,
+        finishedAt: runState.finishedAt,
+        elapsedMs: runState.finishedAt - runState.startedAt,
+        error: runState.error,
+      };
+    default:
+      return { status: "idle" };
+  }
+}
+
+/**
+ * Starts the analysis in the background (or attaches to the in-flight run) and
+ * returns the current status immediately, so the HTTP request never blocks long
+ * enough to hit the tunnel's gateway timeout. Poll {@link getCandidateAnalysisStatus}.
+ */
+export function startCandidateAnalysis(env = process.env): CandidateAnalysisStatus {
+  if (!activeRun) {
+    const startedAt = Date.now();
+    runState = { status: "running", startedAt };
+
+    activeRun = executeCandidateAnalysis(env);
+    activeRun
+      .then((result) => {
+        runState = { status: "completed", startedAt, finishedAt: Date.now(), result };
+      })
+      .catch((error: unknown) => {
+        runState = {
+          status: "failed",
+          startedAt,
+          finishedAt: Date.now(),
+          error: error instanceof Error ? error.message : String(error),
+        };
+      })
+      .finally(() => {
+        activeRun = null;
+      });
+  }
+
+  return getCandidateAnalysisStatus();
+}
+
+/**
+ * Backwards-compatible blocking variant: starts the run if needed and awaits it.
+ * Prefer {@link startCandidateAnalysis} + polling for anything fronted by a proxy
+ * or tunnel that enforces a request timeout.
+ */
 export async function runCandidateAnalysis(env = process.env): Promise<CandidateAnalysisRunResult> {
   if (!activeRun) {
     activeRun = executeCandidateAnalysis(env).finally(() => {

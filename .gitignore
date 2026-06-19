@@ -1,20 +1,32 @@
-# 환경변수 / 시크릿 (절대 커밋 금지)
+# Environment variables / secrets
+# Ignore .env and all variants (.env.local, .env.production, …) but keep the
+# committed template. Prevents accidentally committing the GEMINI/NAVER/KIS keys.
 .env
+.env.*
+!.env.example
 kis_token_cache.json
 
-# 파이썬 캐시
+# Python cache
 __pycache__/
 *.pyc
+.pytest_cache/
+.ipynb_checkpoints/
 
-# 실행 산출물
+# Runtime outputs (incl. crolling.py news_gemini_result.json, pipeline CSV/JSON)
 outputs/
+*.log
 
-# 신선 OHLCV 캐시 (매 실행 재생성, 커밋 불필요)
+# Fresh OHLCV cache, regenerated per run
 fresh_ohlcv.parquet
 
-# 가상환경 / OS
+# Local tool state
+.claude/
+
+# Virtual environments / OS
+venv/
+.venv/
 venv-timesfm/
 .DS_Store
 
-# 주의: shared_*.parquet 은 재현성 위해 커밋 유지 → .gitignore에 넣지 않는다.
-# (과거 *.parquet 일괄 무시 규칙은 제거함)
+# Keep shared_*.parquet tracked for reproducibility.
+# Do not reintroduce a broad *.parquet ignore rule.

@@ -226,7 +226,16 @@ export function StockDetailPage() {
   const news = row?.news ?? [];
   const kospi = findKospiIndex(detail.dashboard.indices);
   const gate = evaluateRiskGate(stock, kospi);
-  const llmReady = hasLlmSentiment(stock);
+  // The freshly-fetched candidate row is the authoritative AI source for this
+  // report — prefer it over the dashboard snapshot quote, whose AI fields are
+  // only populated once a snapshot refresh has merged the pipeline output. This
+  // makes the Gemini news/sentiment view appear right after an analysis run,
+  // independent of snapshot timing.
+  const hasResultSentiment = (result?.confidence ?? 0) > 0;
+  const llmReady = hasResultSentiment || hasLlmSentiment(stock);
+  const verdictLabel = hasResultSentiment && result ? result.label : stock.sentimentLabel;
+  const verdictConfidence = hasResultSentiment && result ? result.confidence : stock.confidence;
+  const verdictSummary = hasResultSentiment && result ? result.summary : describeAiSummary(stock);
   const isWatched = watchCodes.includes(stock.code);
 
   function toggleWatch() {
@@ -280,9 +289,9 @@ export function StockDetailPage() {
       <section className="detail-card detail-verdict">
         <h2>AI 투자 의견</h2>
         <div className="verdict-grid">
-          <div className={`verdict-headline verdict-headline--${stock.sentimentLabel.toLowerCase()}`}>
+          <div className={`verdict-headline verdict-headline--${verdictLabel.toLowerCase()}`}>
             <span>{llmReady ? "뉴스 감성" : "예측 방향"}</span>
-            <strong>{sentimentKo(stock.sentimentLabel)}</strong>
+            <strong>{sentimentKo(verdictLabel)}</strong>
           </div>
           <div className="detail-stats verdict-stats">
             <StatRow
@@ -290,7 +299,7 @@ export function StockDetailPage() {
               value={stock.predictedReturn === null ? "—" : formatRate(stock.predictedReturn)}
               tone={stock.predictedReturn === null ? undefined : changeTone(stock.predictedReturn)}
             />
-            <StatRow label="신뢰도" value={llmReady ? `${Math.round(stock.confidence * 100)}%` : "—"} />
+            <StatRow label="신뢰도" value={llmReady ? `${Math.round(verdictConfidence * 100)}%` : "—"} />
             {result ? (
               <StatRow
                 label="감성 점수"
@@ -300,7 +309,7 @@ export function StockDetailPage() {
             ) : null}
           </div>
         </div>
-        <p className="reason-text">{describeAiSummary(stock)}</p>
+        <p className="reason-text">{verdictSummary}</p>
         {/* `caution` carries the internal fallback reason (e.g. the missing API
             key) for fallback rows — only surface it for genuine LLM analyses,
             where it's a real analytical caveat rather than a diagnostic string. */}
@@ -336,26 +345,34 @@ export function StockDetailPage() {
       </section>
 
       <section className="detail-card">
-        <h2>뉴스·감성 근거 (LLM)</h2>
+        <h2>뉴스·감성 근거 (Gemini)</h2>
         {llmReady && result ? (
-          <div className="factor-columns">
-            <div>
-              <h3 className="factor-heading is-positive-text">긍정 요인</h3>
-              <FactorList items={result.positive_factors} tone="positive" />
+          <>
+            <div className="factor-columns">
+              <div>
+                <h3 className="factor-heading is-positive-text">긍정 요인</h3>
+                <FactorList items={result.positive_factors} tone="positive" />
+              </div>
+              <div>
+                <h3 className="factor-heading is-negative-text">부정 요인</h3>
+                <FactorList items={result.negative_factors} tone="negative" />
+              </div>
+              <div>
+                <h3 className="factor-heading">핵심 데이터</h3>
+                <FactorList items={result.key_data_points} tone="neutral" />
+              </div>
             </div>
-            <div>
-              <h3 className="factor-heading is-negative-text">부정 요인</h3>
-              <FactorList items={result.negative_factors} tone="negative" />
-            </div>
-            <div>
-              <h3 className="factor-heading">핵심 데이터</h3>
-              <FactorList items={result.key_data_points} tone="neutral" />
-            </div>
-          </div>
+            {result.trading_insight ? (
+              <p className="trading-insight">
+                <strong>투자 인사이트</strong> {result.trading_insight}
+              </p>
+            ) : null}
+          </>
         ) : (
           <p className="factor-empty">
-            OpenAI 뉴스 감성 분석이 연결되지 않아 LLM 근거가 없습니다. 서버에 OPENAI_API_KEY를 설정하고 AI
-            후보 분석을 실행하면 뉴스 기반 긍·부정 요인이 이 영역에 표시됩니다.
+            Gemini 뉴스 감성 분석이 연결되지 않아 LLM 근거가 없습니다. 서버 .env에 GEMINI_API_KEY와 네이버
+            검색 API 키(NAVER_CLIENT_ID/SECRET)를 설정하고 AI 후보 분석을 실행하면 뉴스 기반 감성 근거가 이
+            영역에 표시됩니다.
           </p>
         )}
 
@@ -424,7 +441,7 @@ export function StockDetailPage() {
         <ul>
           <li>시세·거래대금·투자자 수급: 한국투자증권(KIS) Open API.</li>
           <li>익일 수익률 예측: 자체 학습 LSTM 모델 (예측 기준일 {modelRow?.lstm_base_date ?? "—"}).</li>
-          <li>뉴스·감성: 네이버 뉴스 + OpenAI 구조화 분석 (키 미설정 시 LSTM 방향만 반영).</li>
+          <li>뉴스·감성: 네이버 뉴스 + Gemini 구조화 분석 (키 미설정 시 모델 예측 방향만 반영).</li>
           <li>기준 시각: {detail.dashboard.generatedAt} · {detail.dashboard.sessionLabel}</li>
         </ul>
         <p className="panel-note">

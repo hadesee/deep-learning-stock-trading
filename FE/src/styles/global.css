@@ -232,6 +232,7 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  padding-top: 10px;
   margin: 0 0 18px;
   color: var(--color-charcoal);
   font-size: 14px;
@@ -3473,6 +3474,25 @@ h3 {
   color: #875114;
   font-size: 13px;
   font-weight: 600;
+}
+
+.trading-insight {
+  margin: 16px 0 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border-left: 3px solid var(--color-accent, #2f6df6);
+  background: rgba(47, 109, 246, 0.07);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-ink, #1f2733);
+}
+
+.trading-insight strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--color-accent, #2f6df6);
 }
 
 .factor-columns {

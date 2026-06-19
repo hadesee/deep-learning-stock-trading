@@ -13,6 +13,8 @@ export type PipelineAnalysisResult = {
   key_data_points: string[];
   used_news_indices: number[];
   caution: string;
+  /** Gemini news step: actionable position/risk note for the stock. */
+  trading_insight?: string;
 };
 
 export type PipelineInputRow = {
@@ -22,6 +24,10 @@ export type PipelineInputRow = {
   lstm_pred_return?: number;
   ensemble_pred_return?: number;
   lstm_base_date?: string;
+  p_up?: number;
+  pred_rank?: number;
+  prediction_status?: string;
+  transformer_base_date?: string;
   [key: string]: unknown;
 };
 
@@ -62,6 +68,7 @@ export type Candidate = {
   sentimentScore: number;
   confidence: number;
   predictedReturn: number | null;
+  upProbability?: number | null;
   lstmStatus: string;
   summary: string;
   positiveFactors: string[];
@@ -128,6 +135,7 @@ export type StockQuote = {
   sentimentLabel: PipelineSentimentLabel;
   confidence: number;
   predictedReturn: number | null;
+  upProbability?: number | null;
   miniSeries: number[];
   /**
    * Daily OHLC history, oldest first. Supplied by the backend daily-chart

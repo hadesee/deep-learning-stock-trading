@@ -469,6 +469,19 @@ function toFiniteOrNull(value: unknown): number | null {
   return null;
 }
 
+function upProbabilityFromRow(aiRow: PipelineOutputRow | undefined): number | null {
+  return toFiniteOrNull(aiRow?.input_row?.p_up);
+}
+
+function modelScoreFromRow(aiRow: PipelineOutputRow | undefined): number | null {
+  const pUp = upProbabilityFromRow(aiRow);
+  if (pUp !== null) {
+    return null;
+  }
+
+  return toFiniteOrNull(aiRow?.input_row?.ensemble_pred_return) ?? toFiniteOrNull(aiRow?.input_row?.lstm_pred_return);
+}
+
 /**
  * Latest-session net buying per investor group from the KIS investor-trend
  * endpoint. The output is a daily array (newest first). Failures degrade to
@@ -521,11 +534,11 @@ function mergeAiFields(direction: MarketDirection, aiRow: PipelineOutputRow | un
       confidence: 0,
       predictedReturn: null as number | null,
       sentimentLabel: sentimentFromDirection(direction),
+      upProbability: null as number | null,
     };
   }
 
-  const predictedReturn =
-    toFiniteOrNull(aiRow.input_row?.ensemble_pred_return) ?? toFiniteOrNull(aiRow.input_row?.lstm_pred_return);
+  const predictedReturn = modelScoreFromRow(aiRow);
 
   return {
     aiSummary: aiRow.result?.summary?.trim()
@@ -534,6 +547,7 @@ function mergeAiFields(direction: MarketDirection, aiRow: PipelineOutputRow | un
     confidence: toFiniteOrNull(aiRow.result?.confidence) ?? 0,
     predictedReturn,
     sentimentLabel: aiRow.result?.label ?? sentimentFromDirection(direction),
+    upProbability: upProbabilityFromRow(aiRow),
   };
 }
 
@@ -590,6 +604,7 @@ async function fetchStockQuote(
     sentimentLabel: ai.sentimentLabel,
     confidence: ai.confidence,
     predictedReturn: ai.predictedReturn,
+    upProbability: ai.upProbability,
     miniSeries: miniSeriesFromChange(currentPrice, change),
   } satisfies StockQuote;
 }

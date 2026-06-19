@@ -86,6 +86,10 @@ function normalizeSearch(value: string) {
 }
 
 function isAiCandidate(stock: StockQuote) {
+  if (stock.upProbability !== undefined && stock.upProbability !== null) {
+    return stock.sentimentLabel === "POSITIVE" && stock.upProbability >= 0.5;
+  }
+
   return stock.sentimentLabel === "POSITIVE" && (stock.predictedReturn ?? 0) >= 0.4;
 }
 

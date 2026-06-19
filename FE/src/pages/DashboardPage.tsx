@@ -77,7 +77,8 @@ export function DashboardPage() {
 
     try {
       const result = await runCandidateAnalysis();
-      setAnalysisMessage(`AI 후보 ${result.rows}개 분석 완료. 산출물 JSON이 생성되었습니다.`);
+      const newsNote = result.newsRows && result.newsRows > 0 ? ` · 뉴스 감성 ${result.newsRows}개 종목` : "";
+      setAnalysisMessage(`AI 후보 ${result.rows}개 분석 완료${newsNote}. 산출물이 생성되었습니다.`);
       reload();
     } catch (cause) {
       setAnalysisMessage(undefined);
