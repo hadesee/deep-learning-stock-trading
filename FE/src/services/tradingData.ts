@@ -441,6 +441,60 @@ export async function fetchPipelineCandidates(signal?: AbortSignal): Promise<Pip
   return mockPipelineResults;
 }
 
+/** Loads one stock from the full Transformer ranking, not only the final Top10. */
+export async function fetchStockAnalysis(
+  ticker: string,
+  signal?: AbortSignal,
+): Promise<PipelineOutputRow | null> {
+  const normalized = ticker.replace(/\D/g, "").padStart(6, "0").slice(-6);
+  try {
+    return await fetchJson<PipelineOutputRow | null>(
+      `/api/stock-analysis?ticker=${encodeURIComponent(normalized)}`,
+      signal,
+      API_BASE_URL,
+    );
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
+    if (import.meta.env.DEV) {
+      console.warn(`Stock analysis API unavailable for ${normalized}.`, error);
+    }
+    return null;
+  }
+}
+
+type StockNewsAnalysisStatus = {
+  status: "idle" | "running" | "completed" | "failed";
+  ticker: string;
+  error?: string;
+};
+
+/** Runs Naver-news + Gemini analysis for one selected stock and polls to completion. */
+export async function runStockNewsAnalysis(ticker: string, signal?: AbortSignal): Promise<void> {
+  const normalized = ticker.replace(/\D/g, "").padStart(6, "0").slice(-6);
+  const baseUrl = isLiveApiEnabled() ? API_BASE_URL : "";
+  const path = `/api/stock-analysis/run?ticker=${encodeURIComponent(normalized)}`;
+  await postJson<StockNewsAnalysisStatus>(path, signal, baseUrl, REQUEST_TIMEOUT_MS);
+
+  const deadline = Date.now() + CANDIDATE_ANALYSIS_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await delay(CANDIDATE_ANALYSIS_POLL_MS, signal);
+    const status = await fetchJson<StockNewsAnalysisStatus>(path, signal, baseUrl, REQUEST_TIMEOUT_MS);
+    if (status.status === "completed") {
+      return;
+    }
+    if (status.status === "failed") {
+      throw new Error(status.error ?? `${normalized} 뉴스 분석에 실패했습니다.`);
+    }
+    if (status.status === "idle") {
+      throw new Error(`${normalized} 뉴스 분석이 시작되지 않았습니다.`);
+    }
+  }
+
+  throw new Error(`${normalized} 뉴스 분석 시간이 초과되었습니다.`);
+}
+
 type CandidateAnalysisStatus = {
   status: "idle" | "running" | "completed" | "failed";
   result?: CandidateAnalysisRunResult;

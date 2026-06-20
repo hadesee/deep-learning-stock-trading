@@ -7,12 +7,13 @@ import { useAsyncData } from "../hooks/useAsyncData";
 import { usePageTitle } from "../hooks/usePageTitle";
 import {
   fetchMarketDashboardData,
-  fetchPipelineCandidates,
+  fetchStockAnalysis,
   getMarketDashboardData,
   readWatchlistCodes,
+  runStockNewsAnalysis,
   writeWatchlistCodes,
 } from "../services/tradingData";
-import { describeAiSummary, findPipelineRow, hasLlmSentiment } from "../utils/aiSignal";
+import { describeAiSummary, hasLlmSentiment } from "../utils/aiSignal";
 import type {
   MarketDashboardData,
   MarketDirection,
@@ -22,9 +23,14 @@ import type {
 } from "../types/trading";
 
 type DetailData = {
-  candidates: PipelineOutputRow[];
+  analysis: PipelineOutputRow | null;
   dashboard: MarketDashboardData;
 };
+
+function finiteNumber(value: unknown): number | null {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
 function formatWon(value: number) {
   return `${Math.round(value).toLocaleString("ko-KR")}원`;
@@ -173,21 +179,25 @@ function FlowBars({ flow }: { flow: StockQuote["investorFlow"] }) {
   );
 }
 
-const initialDetailData = (): DetailData => ({ candidates: [], dashboard: getMarketDashboardData() });
+const initialDetailData = (): DetailData => ({ analysis: null, dashboard: getMarketDashboardData() });
 
-async function loadDetailData(signal: AbortSignal): Promise<DetailData> {
-  const [dashboard, candidates] = await Promise.all([
+async function loadDetailData(code: string, signal: AbortSignal): Promise<DetailData> {
+  const [dashboard, analysis] = await Promise.all([
     fetchMarketDashboardData(signal),
-    fetchPipelineCandidates(signal),
+    fetchStockAnalysis(code, signal),
   ]);
 
-  return { candidates, dashboard };
+  return { analysis, dashboard };
 }
 
 export function StockDetailPage() {
   const { code = "" } = useParams<{ code: string }>();
   const [seed] = useState(initialDetailData);
-  const { data, error, isLoading, isRefreshing } = useAsyncData(loadDetailData, [], seed);
+  const { data, error, isLoading, isRefreshing, reload } = useAsyncData(
+    (signal) => loadDetailData(code, signal),
+    [code],
+    seed,
+  );
 
   const detail = data ?? seed;
   const stock =
@@ -197,6 +207,11 @@ export function StockDetailPage() {
   usePageTitle(stock ? `${stock.name} ${stock.code}` : "종목 상세");
 
   const [watchCodes, setWatchCodes] = useState<string[]>(() => readWatchlistCodes() ?? []);
+  const [newsAnalysisState, setNewsAnalysisState] = useState<{
+    error: string;
+    isRunning: boolean;
+    message: string;
+  }>({ error: "", isRunning: false, message: "" });
   useEffect(() => {
     writeWatchlistCodes(watchCodes);
   }, [watchCodes]);
@@ -220,23 +235,51 @@ export function StockDetailPage() {
     );
   }
 
-  const row = findPipelineRow(detail.candidates, stock.code);
+  const row = detail.analysis;
   const result = row?.result;
   const modelRow = row?.input_row;
   const news = row?.news ?? [];
+  const upProbability = finiteNumber(modelRow?.p_up) ?? stock.upProbability ?? null;
+  const legacyPredictedReturn =
+    finiteNumber(modelRow?.lstm_pred_return) ??
+    (modelRow?.p_up === undefined ? finiteNumber(modelRow?.ensemble_pred_return) : null) ??
+    stock.predictedReturn;
   const kospi = findKospiIndex(detail.dashboard.indices);
-  const gate = evaluateRiskGate(stock, kospi);
+  const analyzedStock: StockQuote = {
+    ...stock,
+    aiSummary: result?.summary || stock.aiSummary,
+    confidence: result?.confidence ?? stock.confidence,
+    predictedReturn: legacyPredictedReturn,
+    sentimentLabel: result?.label ?? stock.sentimentLabel,
+    upProbability,
+  };
+  const gate = evaluateRiskGate(analyzedStock, kospi);
   // The freshly-fetched candidate row is the authoritative AI source for this
   // report — prefer it over the dashboard snapshot quote, whose AI fields are
   // only populated once a snapshot refresh has merged the pipeline output. This
   // makes the Gemini news/sentiment view appear right after an analysis run,
   // independent of snapshot timing.
   const hasResultSentiment = (result?.confidence ?? 0) > 0;
-  const llmReady = hasResultSentiment || hasLlmSentiment(stock);
-  const verdictLabel = hasResultSentiment && result ? result.label : stock.sentimentLabel;
-  const verdictConfidence = hasResultSentiment && result ? result.confidence : stock.confidence;
-  const verdictSummary = hasResultSentiment && result ? result.summary : describeAiSummary(stock);
+  const llmReady = hasResultSentiment || hasLlmSentiment(analyzedStock);
+  const verdictLabel = result?.label ?? analyzedStock.sentimentLabel;
+  const verdictConfidence = hasResultSentiment && result ? result.confidence : analyzedStock.confidence;
+  const verdictSummary = result?.summary || describeAiSummary(analyzedStock);
   const isWatched = watchCodes.includes(stock.code);
+
+  async function analyzeSelectedStockNews() {
+    setNewsAnalysisState({ error: "", isRunning: true, message: "뉴스와 Gemini 분석을 실행 중입니다." });
+    try {
+      await runStockNewsAnalysis(stock!.code);
+      setNewsAnalysisState({ error: "", isRunning: false, message: "뉴스 분석이 완료되었습니다." });
+      reload();
+    } catch (cause) {
+      setNewsAnalysisState({
+        error: cause instanceof Error ? cause.message : "뉴스 분석에 실패했습니다.",
+        isRunning: false,
+        message: "",
+      });
+    }
+  }
 
   function toggleWatch() {
     setWatchCodes((current) =>
@@ -295,9 +338,21 @@ export function StockDetailPage() {
           </div>
           <div className="detail-stats verdict-stats">
             <StatRow
-              label="예상 수익률(익일)"
-              value={stock.predictedReturn === null ? "—" : formatRate(stock.predictedReturn)}
-              tone={stock.predictedReturn === null ? undefined : changeTone(stock.predictedReturn)}
+              label={upProbability !== null ? "상승 확률(익일)" : "예상 수익률(익일)"}
+              value={
+                upProbability !== null
+                  ? `${(upProbability * 100).toFixed(2)}%`
+                  : legacyPredictedReturn === null
+                    ? "—"
+                    : formatRate(legacyPredictedReturn)
+              }
+              tone={
+                upProbability !== null
+                  ? changeTone(upProbability - 0.5)
+                  : legacyPredictedReturn === null
+                    ? undefined
+                    : changeTone(legacyPredictedReturn)
+              }
             />
             <StatRow label="신뢰도" value={llmReady ? `${Math.round(verdictConfidence * 100)}%` : "—"} />
             {result ? (
@@ -317,35 +372,59 @@ export function StockDetailPage() {
       </section>
 
       <section className="detail-card">
-        <h2>예측 모델 근거 (LSTM)</h2>
+        <h2>예측 모델 근거 (Transformer)</h2>
         {modelRow ? (
           <div className="detail-stats">
             <StatRow
-              label="LSTM 예측 수익률"
-              value={modelRow.lstm_pred_return === undefined ? "—" : formatRate(modelRow.lstm_pred_return)}
-              tone={modelRow.lstm_pred_return === undefined ? undefined : changeTone(modelRow.lstm_pred_return)}
+              label="익일 상승 확률"
+              value={upProbability === null ? "—" : `${(upProbability * 100).toFixed(2)}%`}
+              tone={upProbability === null ? undefined : changeTone(upProbability - 0.5)}
             />
             <StatRow
-              label="앙상블 예측 수익률"
-              value={modelRow.ensemble_pred_return === undefined ? "—" : formatRate(modelRow.ensemble_pred_return)}
-              tone={modelRow.ensemble_pred_return === undefined ? undefined : changeTone(modelRow.ensemble_pred_return)}
+              label="전체 예측 순위"
+              value={
+                finiteNumber(modelRow.pred_rank) === null
+                  ? "—"
+                  : `${finiteNumber(modelRow.pred_rank)}위 / ${finiteNumber(modelRow.pred_pool_size) ?? "—"}개`
+              }
             />
-            <StatRow label="예측 기준일" value={modelRow.lstm_base_date ?? "—"} />
-            <StatRow label="모델 상태" value={modelRow.lstm_status ?? "—"} />
+            <StatRow
+              label="예측 기준일"
+              value={String(modelRow.transformer_base_date ?? modelRow.lstm_base_date ?? "—")}
+            />
+            <StatRow
+              label="모델 상태"
+              value={String(modelRow.prediction_status ?? modelRow.lstm_status ?? "—")}
+            />
+            <StatRow label="시계열 데이터" value={String(modelRow.ohlcv_source ?? "—")} />
           </div>
         ) : (
           <p className="factor-empty">
-            이 종목은 최근 AI 후보 분석에 포함되지 않았습니다. 상단 대시보드의 “AI 후보 분석”을 실행하면 채워집니다.
+            이 종목의 Transformer 예측 결과가 없습니다. OHLCV 데이터 부족 또는 예측 실패 상태를 확인해야 합니다.
           </p>
         )}
         <p className="panel-note">
-          OHLC 비율 피처를 RobustScaler로 정규화해 학습된 LSTM이 다음 거래일 수익률을 예측합니다. 예측값은 투자
-          판단의 참고 지표이며, 확정 수익을 보장하지 않습니다.
+          OHLCV 기술지표 시퀀스를 학습한 Transformer 분류 모델이 다음 거래일 상승 확률을 계산합니다. 확률은 투자
+          판단의 참고 지표이며, 수익률이나 수익을 보장하지 않습니다.
         </p>
       </section>
 
       <section className="detail-card">
-        <h2>뉴스·감성 근거 (Gemini)</h2>
+        <div className="detail-card-heading">
+          <h2>뉴스·감성 근거 (Gemini)</h2>
+          <button
+            className="secondary-button"
+            disabled={newsAnalysisState.isRunning || !modelRow}
+            onClick={analyzeSelectedStockNews}
+            type="button"
+          >
+            {newsAnalysisState.isRunning ? "분석 중" : llmReady ? "뉴스 다시 분석" : "이 종목 뉴스 분석"}
+          </button>
+        </div>
+        {newsAnalysisState.message ? <p className="detail-analysis-status">{newsAnalysisState.message}</p> : null}
+        {newsAnalysisState.error ? (
+          <p className="detail-analysis-status detail-analysis-status--error">{newsAnalysisState.error}</p>
+        ) : null}
         {llmReady && result ? (
           <>
             <div className="factor-columns">
@@ -370,9 +449,8 @@ export function StockDetailPage() {
           </>
         ) : (
           <p className="factor-empty">
-            Gemini 뉴스 감성 분석이 연결되지 않아 LLM 근거가 없습니다. 서버 .env에 GEMINI_API_KEY와 네이버
-            검색 API 키(NAVER_CLIENT_ID/SECRET)를 설정하고 AI 후보 분석을 실행하면 뉴스 기반 감성 근거가 이
-            영역에 표시됩니다.
+            이 종목의 Gemini 분석 결과가 아직 없습니다. 위 버튼을 누르면 현재 종목만 네이버 뉴스와 기술지표를
+            결합해 분석합니다.
           </p>
         )}
 
@@ -440,7 +518,9 @@ export function StockDetailPage() {
         <h2>데이터 출처 및 유의사항</h2>
         <ul>
           <li>시세·거래대금·투자자 수급: 한국투자증권(KIS) Open API.</li>
-          <li>익일 수익률 예측: 자체 학습 LSTM 모델 (예측 기준일 {modelRow?.lstm_base_date ?? "—"}).</li>
+          <li>
+            익일 상승 확률: 자체 학습 Transformer 모델 (예측 기준일 {String(modelRow?.transformer_base_date ?? "—")}).
+          </li>
           <li>뉴스·감성: 네이버 뉴스 + Gemini 구조화 분석 (키 미설정 시 모델 예측 방향만 반영).</li>
           <li>기준 시각: {detail.dashboard.generatedAt} · {detail.dashboard.sessionLabel}</li>
         </ul>

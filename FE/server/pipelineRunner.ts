@@ -399,3 +399,119 @@ export async function runCandidateAnalysis(env = process.env): Promise<Candidate
 
   return activeRun;
 }
+
+export type StockNewsAnalysisResult = {
+  elapsedMs: number;
+  status: "completed";
+  ticker: string;
+};
+
+export type StockNewsAnalysisStatus = {
+  status: "idle" | "running" | "completed" | "failed";
+  ticker: string;
+  startedAt?: number;
+  finishedAt?: number;
+  elapsedMs?: number;
+  result?: StockNewsAnalysisResult;
+  error?: string;
+};
+
+type StockNewsRunState =
+  | { status: "running"; ticker: string; startedAt: number }
+  | { status: "completed"; ticker: string; startedAt: number; finishedAt: number; result: StockNewsAnalysisResult }
+  | { status: "failed"; ticker: string; startedAt: number; finishedAt: number; error: string };
+
+const stockNewsRuns = new Map<string, Promise<StockNewsAnalysisResult>>();
+const stockNewsStates = new Map<string, StockNewsRunState>();
+
+function normalizedTicker(value: string): string {
+  const ticker = String(value ?? "").replace(/\D/g, "").padStart(6, "0").slice(-6);
+  if (!/^\d{6}$/.test(ticker) || ticker === "000000") {
+    throw new Error("A valid 6-digit ticker is required.");
+  }
+  return ticker;
+}
+
+async function executeStockNewsAnalysis(
+  ticker: string,
+  env: Record<string, string | undefined>,
+): Promise<StockNewsAnalysisResult> {
+  const startedAt = Date.now();
+  const root = projectRoot(env);
+  const outputDir = resolve(env.PIPELINE_OUTPUT_DIR ?? join(root, "outputs"));
+  const scriptPath = resolve(env.PIPELINE_NEWS_SCRIPT ?? join(root, "crolling.py"));
+  const inputPath = join(outputDir, "step2_all_transformer_rank.csv");
+  const outputPath = join(outputDir, NEWS_RESULT_FILE);
+  const python = await pythonExecutable(root, env);
+  const timeoutMs = Number(env.PIPELINE_RUN_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
+
+  await requireExistingFile(scriptPath, "News analysis script");
+  await requireExistingFile(inputPath, "Full Transformer ranking");
+
+  const args = [
+    scriptPath,
+    "--input",
+    inputPath,
+    "--ticker",
+    ticker,
+    "--output",
+    outputPath,
+    "--merge",
+  ];
+  optionalNumericArg(args, "--days", env.PIPELINE_RUN_NEWS_DAYS);
+  optionalNumericArg(args, "--max-news", env.PIPELINE_RUN_MAX_NEWS);
+
+  await runProcess(python, args, root, pipelineEnv(env), timeoutMs);
+
+  const parsed = JSON.parse(await readFile(outputPath, "utf8")) as Record<string, unknown>;
+  if (!parsed[ticker]) {
+    throw new Error(`Gemini analysis did not return a result for ${ticker}.`);
+  }
+
+  return { elapsedMs: Date.now() - startedAt, status: "completed", ticker };
+}
+
+export function getStockNewsAnalysisStatus(tickerValue: string): StockNewsAnalysisStatus {
+  const ticker = normalizedTicker(tickerValue);
+  const state = stockNewsStates.get(ticker);
+  if (!state) {
+    return { status: "idle", ticker };
+  }
+  if (state.status === "running") {
+    return { ...state, elapsedMs: Date.now() - state.startedAt };
+  }
+  return {
+    ...state,
+    elapsedMs: state.finishedAt - state.startedAt,
+  };
+}
+
+export function startStockNewsAnalysis(
+  tickerValue: string,
+  env = process.env,
+): StockNewsAnalysisStatus {
+  const ticker = normalizedTicker(tickerValue);
+  if (!stockNewsRuns.has(ticker)) {
+    const startedAt = Date.now();
+    stockNewsStates.set(ticker, { status: "running", ticker, startedAt });
+    const run = executeStockNewsAnalysis(ticker, env);
+    stockNewsRuns.set(ticker, run);
+    run
+      .then((result) => {
+        stockNewsStates.set(ticker, { status: "completed", ticker, startedAt, finishedAt: Date.now(), result });
+      })
+      .catch((error: unknown) => {
+        stockNewsStates.set(ticker, {
+          status: "failed",
+          ticker,
+          startedAt,
+          finishedAt: Date.now(),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => {
+        stockNewsRuns.delete(ticker);
+      });
+  }
+  return getStockNewsAnalysisStatus(ticker);
+}

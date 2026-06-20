@@ -1,8 +1,13 @@
 import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { buildKisDashboard, buildKisStockChart, refreshDashboardSnapshot } from "./server/kisDashboard";
-import { getCandidatesPayload } from "./server/pipelineResults";
-import { getCandidateAnalysisStatus, startCandidateAnalysis } from "./server/pipelineRunner";
+import { getCandidatesPayload, getStockAnalysisPayload } from "./server/pipelineResults";
+import {
+  getCandidateAnalysisStatus,
+  getStockNewsAnalysisStatus,
+  startCandidateAnalysis,
+  startStockNewsAnalysis,
+} from "./server/pipelineRunner";
 
 declare const process: {
   cwd: () => string;
@@ -81,6 +86,35 @@ function kisApiPlugin(): Plugin {
         }
 
         return buildKisStockChart(symbol);
+      });
+      server.middlewares.use("/api/stock-analysis/run", async (request, response) => {
+        const typedRequest = request as DevRequest;
+        const ticker = queryValue(typedRequest, "ticker") ?? queryValue(typedRequest, "code");
+        if (!ticker) {
+          writeJson(response, 400, { error: "ticker query parameter is required." });
+          return;
+        }
+
+        try {
+          if (typedRequest.method === "POST") {
+            writeJson(response, 200, startStockNewsAnalysis(ticker));
+          } else if (typedRequest.method === "GET") {
+            writeJson(response, 200, getStockNewsAnalysisStatus(ticker));
+          } else {
+            writeJson(response, 405, { error: "Method not allowed" });
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Stock news analysis failed.";
+          writeJson(response, 502, { error: message });
+        }
+      });
+      jsonRequestRoute(server, "/api/stock-analysis", "GET", (request) => {
+        const ticker = queryValue(request, "ticker") ?? queryValue(request, "code");
+        if (!ticker) {
+          throw new Error("ticker query parameter is required.");
+        }
+
+        return getStockAnalysisPayload(ticker);
       });
       // The analysis runs for minutes, so the request must not block: POST kicks
       // off (or re-attaches to) the background job and returns the current status

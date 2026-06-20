@@ -11,11 +11,16 @@ declare const process: {
 const JSON_RESULT_FILES = ["final_stock_transformer_news_llm_result.json"];
 const LEGACY_JSON_RESULT_FILES = ["final_stock_lstm_news_llm_result.json"];
 const CSV_RESULT_FILES = ["step2_final_top10.csv"];
+const FULL_RANK_CSV_RESULT_FILES = ["step2_all_transformer_rank.csv"];
 const NEWS_RESULT_FILES = ["news_gemini_result.json"];
 
 type GeminiEvaluation = {
   sentiment?: unknown;
   impact_score?: unknown;
+  final_sentiment?: unknown;
+  final_combined_score?: unknown;
+  news_overall_score?: unknown;
+  news_sentiment_tally?: unknown;
   summary?: unknown;
   trading_insight?: unknown;
 };
@@ -37,12 +42,12 @@ type LoadedRows = {
  * The dev server's cwd is usually `FE/`, so probe the root outputs folder plus
  * common alternatives. `PIPELINE_RESULT_PATH` may point to either JSON or CSV.
  */
-function candidatePaths(fileNames: string[]): string[] {
+function candidatePaths(fileNames: string[], includeOverride = true): string[] {
   const override = process.env.PIPELINE_RESULT_PATH;
   const outputDir = process.env.PIPELINE_OUTPUT_DIR;
   const cwd = process.cwd();
   const paths = [
-    ...(override ? [override] : []),
+    ...(includeOverride && override ? [override] : []),
     ...(outputDir ? fileNames.map((fileName) => join(outputDir, fileName)) : []),
     ...fileNames.flatMap((fileName) => [
       join(cwd, "outputs", fileName),
@@ -167,14 +172,16 @@ function transformerCsvToPipelineRow(record: Record<string, string>): PipelineOu
   const pUp = toFiniteOrNull(record.p_up);
   const predRank = toFiniteOrNull(record.pred_rank);
   const supplyPass = boolFromCsv(record.supply_pass);
+  const supplyStatus = stringValue(record.supply_status);
+  const supplyChecked = supplyStatus !== "" && supplyStatus !== "not_checked";
   const label = supplyPass || (pUp !== null && pUp >= 0.5) ? "POSITIVE" : "NEGATIVE";
   const pUpPercent = pUp === null ? null : Number((pUp * 100).toFixed(2));
   const status = stringValue(record.prediction_status, "unknown");
   const keyDataPoints = [
     pUpPercent === null ? undefined : `Transformer P(up): ${pUpPercent}%`,
     predRank === null ? undefined : `Prediction rank: ${predRank}`,
-    record.supply_score ? `Supply score: ${record.supply_score}` : undefined,
-    record.supply_base_end_date ? `Supply base date: ${record.supply_base_end_date}` : undefined,
+    supplyChecked && record.supply_score ? `Supply score: ${record.supply_score}` : undefined,
+    supplyChecked && record.supply_base_end_date ? `Supply base date: ${record.supply_base_end_date}` : undefined,
   ].filter((value): value is string => Boolean(value));
 
   const inputRow: PipelineInputRow = {
@@ -200,13 +207,21 @@ function transformerCsvToPipelineRow(record: Record<string, string>): PipelineOu
       key_data_points: keyDataPoints,
       label,
       label_ko: label === "POSITIVE" ? "긍정" : "부정",
-      negative_factors: supplyPass ? [] : ["Supply filter did not pass or was unavailable."],
-      positive_factors: supplyPass ? ["Passed Transformer ranking and supply filter."] : [],
+      negative_factors: [
+        pUp !== null && pUp < 0.5 ? `Transformer 상승 확률이 ${pUpPercent}%로 50% 미만입니다.` : undefined,
+        supplyChecked && !supplyPass ? "최근 수급 조건을 충족하지 못했습니다." : undefined,
+      ].filter((value): value is string => Boolean(value)),
+      positive_factors: [
+        pUp !== null && pUp >= 0.5 ? `Transformer 상승 확률이 ${pUpPercent}%로 50% 이상입니다.` : undefined,
+        supplyPass ? "최근 수급 조건을 충족했습니다." : undefined,
+      ].filter((value): value is string => Boolean(value)),
       sentiment_score: pUp === null ? 0 : Number(((pUp - 0.5) * 2).toFixed(4)),
       summary:
         pUpPercent === null
           ? `Transformer prediction status is ${status}.`
-          : `Transformer P(up) ${pUpPercent}% with supply filter ${supplyPass ? "passed" : "not passed"}.`,
+          : `Transformer 상승 확률 ${pUpPercent}%, 전체 예측 순위 ${predRank ?? "미산출"}위입니다${
+              supplyChecked ? `; 수급 조건은 ${supplyPass ? "통과" : "미통과"}입니다` : ""
+            }.`,
       ticker,
       used_news_indices: [],
     },
@@ -233,10 +248,13 @@ async function loadJsonRows(): Promise<LoadedRows | null> {
   return latest;
 }
 
-async function loadCsvRows(): Promise<LoadedRows | null> {
+async function loadCsvRows(
+  fileNames: string[] = CSV_RESULT_FILES,
+  includeOverride = true,
+): Promise<LoadedRows | null> {
   let latest: LoadedRows | null = null;
 
-  for (const path of candidatePaths(CSV_RESULT_FILES)) {
+  for (const path of candidatePaths(fileNames, includeOverride)) {
     try {
       await access(path);
     } catch {
@@ -308,12 +326,17 @@ function toPipelineNews(value: unknown): PipelineOutputRow["news"] {
 function applyNewsToRow(row: PipelineOutputRow, entry: GeminiNewsEntry): PipelineOutputRow {
   const evaluation = entry.evaluation ?? {};
   const impact = toFiniteOrNull(evaluation.impact_score);
+  const combinedScore = toFiniteOrNull(evaluation.final_combined_score);
+  const rawNewsScore = toFiniteOrNull(evaluation.news_overall_score);
+  const newsScore = rawNewsScore === null ? null : clamp(rawNewsScore > 10 ? rawNewsScore / 10 : rawNewsScore, 0, 10);
   const summary = stringValue(evaluation.summary);
-  const sentiment = stringValue(evaluation.sentiment);
+  const sentiment = stringValue(evaluation.final_sentiment) || stringValue(evaluation.sentiment);
+  const sentimentTally = stringValue(evaluation.news_sentiment_tally);
   const tradingInsight = stringValue(evaluation.trading_insight);
   const news = toPipelineNews(entry.news);
 
-  const hasEvaluation = sentiment !== "" || summary !== "" || impact !== null;
+  const hasEvaluation =
+    sentiment !== "" || summary !== "" || impact !== null || combinedScore !== null || newsScore !== null;
   if (!hasEvaluation) {
     // Gemini failed/skipped this ticker — still surface any crawled headlines.
     return news.length > 0 ? { ...row, news } : row;
@@ -323,8 +346,24 @@ function applyNewsToRow(row: PipelineOutputRow, entry: GeminiNewsEntry): Pipelin
   const newsCount = toFiniteOrNull(entry.news_count) ?? news.length;
   const geminiKeyPoints = [
     impact === null ? undefined : `Gemini 영향도 점수: ${impact}/10`,
+    combinedScore === null ? undefined : `기술·뉴스 결합 점수: ${combinedScore}/100`,
+    newsScore === null ? undefined : `뉴스 종합 점수: ${newsScore}/10`,
+    sentimentTally || undefined,
     newsCount > 0 ? `분석 뉴스 ${newsCount}건` : undefined,
   ].filter((value): value is string => Boolean(value));
+
+  const sentimentScore =
+    combinedScore === null
+      ? impact === null
+        ? 0
+        : clamp(impact / 10, -1, 1)
+      : clamp((combinedScore - 50) / 50, -1, 1);
+  const confidence =
+    combinedScore === null
+      ? impact === null
+        ? 0.1
+        : clamp(Math.abs(impact) / 10, 0.1, 1)
+      : clamp(Math.abs(combinedScore - 50) / 50, 0.1, 1);
 
   return {
     ...row,
@@ -333,11 +372,19 @@ function applyNewsToRow(row: PipelineOutputRow, entry: GeminiNewsEntry): Pipelin
       ...row.result,
       label,
       label_ko,
-      sentiment_score: impact === null ? 0 : clamp(impact / 10, -1, 1),
-      confidence: impact === null ? 0.1 : clamp(Math.abs(impact) / 10, 0.1, 1),
+      sentiment_score: sentimentScore,
+      confidence,
       summary: summary || row.result.summary,
       trading_insight: tradingInsight || undefined,
       key_data_points: [...row.result.key_data_points, ...geminiKeyPoints],
+      positive_factors: [
+        ...row.result.positive_factors,
+        ...(newsScore !== null && newsScore > 5 ? [`뉴스 종합 점수가 ${newsScore}/10으로 긍정 우위입니다.`] : []),
+      ],
+      negative_factors: [
+        ...row.result.negative_factors,
+        ...(newsScore !== null && newsScore < 5 ? [`뉴스 종합 점수가 ${newsScore}/10으로 부정 우위입니다.`] : []),
+      ],
       caution: "",
       company_name: row.result.company_name || stringValue(entry.company_name),
     },
@@ -434,6 +481,21 @@ export async function loadPipelineRows(): Promise<PipelineOutputRow[] | null> {
  */
 export async function getCandidatesPayload(): Promise<PipelineOutputRow[]> {
   return (await loadPipelineRows()) ?? [];
+}
+
+/**
+ * Returns one stock's latest Transformer result from the full KOSPI200 ranking.
+ * News/Gemini evidence is overlaid when that ticker has been analyzed.
+ */
+export async function getStockAnalysisPayload(ticker: string): Promise<PipelineOutputRow | null> {
+  const normalized = String(ticker ?? "").replace(/\D/g, "").padStart(6, "0").slice(-6);
+  if (!/^\d{6}$/.test(normalized) || normalized === "000000") {
+    throw new Error("A valid 6-digit ticker is required.");
+  }
+
+  const fullRank = await loadCsvRows(FULL_RANK_CSV_RESULT_FILES, false);
+  const rows = fullRank ? await overlayNewsResult(fullRank.rows) : await loadPipelineRows();
+  return rows?.find((row) => String(row.input_row?.ticker ?? row.result?.ticker ?? "").padStart(6, "0") === normalized) ?? null;
 }
 
 /**
