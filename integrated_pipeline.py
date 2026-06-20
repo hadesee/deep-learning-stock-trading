@@ -5,8 +5,8 @@ integrated_pipeline.py
   1) main.py      -> KOSPI200 전체 후보 수집
   2) Transformer  -> 각 종목 상승확률 P(up) 예측
                   -> KOSPI200 전체 P(up) 랭킹
-                  -> 최근 N거래일 외국인/기관 수급 경향 필터
-                  -> 최종 Top10 CSV 저장
+                  -> Transformer Top10의 최근 N거래일 수급 첨부
+                  -> 최종 Top10 + 수급 CSV 저장
   3) 종료
 
 뉴스 + LLM 단계는 기본 실행에서 절대 실행하지 않는다.
@@ -40,6 +40,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -62,8 +63,13 @@ DEFAULT_MAIN_MODULE       = BASE_DIR / "main.py"
 DEFAULT_TRANSFORMER_CKPT  = BASE_DIR / "transformer_5y.pt"
 DEFAULT_PREDICT_MODULE    = BASE_DIR / "predict.py"
 DEFAULT_OUTPUT_DIR        = BASE_DIR / "outputs"
+DEFAULT_LOCAL_OHLCV       = BASE_DIR / "shared_test_raw.parquet"
 MIN_OHLCV_ROWS            = 60
 SUPPLY_REQUEST_SLEEP_SECONDS = float(os.getenv("KIS_SUPPLY_SLEEP_SECONDS", "0.3"))
+KIS_OHLCV_REQUEST_SLEEP_SECONDS = float(os.getenv("KIS_OHLCV_SLEEP_SECONDS", "0.08"))
+KIS_OHLCV_MAX_RETRIES = max(1, int(os.getenv("KIS_OHLCV_MAX_RETRIES", "3")))
+KIS_OHLCV_CIRCUIT_BREAKER = max(3, int(os.getenv("KIS_OHLCV_CIRCUIT_BREAKER", "10")))
+KST = timezone(timedelta(hours=9))
 
 # config.py(같은 폴더)에서 KIS 토큰매니저/베이스URL 임포트 보장 (main.py 와 동일 패턴)
 if str(BASE_DIR) not in sys.path:
@@ -88,59 +94,54 @@ def _import_from_path(module_name: str, path: Path):
 
 
 # ──────────────────────────────────────────────
-# STEP 1 : KIS API → 실시간 거래대금 상위 종목 선별
+# STEP 1 : KOSPI200 종목 풀 로드
 # ──────────────────────────────────────────────
 
-def step1_scan_top_stocks(main_module_path: Path, pool_n: int) -> pd.DataFrame:
+def step1_load_kospi200_pool(main_module_path: Path, pool_n: int) -> pd.DataFrame:
     """
-    main.py 의 scan_kospi200() 을 호출해 거래대금 상위 후보 풀을 만든다.
-
-    scan_kospi200() 내부에서 이미:
-      1) KOSPI 200 전 종목 KIS API 호출
-      2) 등락률 0~25% 필터 (급등/하한 제외)
-      3) 당일거래대금(원) 내림차순 정렬
-      4) .head(top_n) 반환
-
-    Transformer(STEP 2)가 이 후보 전체에 대해 P(up)을 계산하고 전체 랭킹을 만든다.
-    여기서는 후보 풀(pool_n, 기본 200 = KOSPI200 전 종목)을 요청한다.
-    (구버전의 TOP_N=10 고정 대신 scan_kospi200(top_n=pool_n) 로 직접 요청)
+    실시간 등락률/거래대금으로 선필터하지 않고 KOSPI200 전체 종목 풀을
+    Transformer 입력 후보로 유지한다.
     """
     print(f"\n{'='*60}")
-    print(f"[STEP 1] KIS 실시간 거래대금 기준 KOSPI 200 후보 풀 스캔 (목표 {pool_n}개)")
+    print(f"[STEP 1] KOSPI200 후보 풀 로드 (목표 {pool_n}개)")
     print(f"  모듈 경로: {main_module_path}")
 
     main_mod = _import_from_path("_kis_main", main_module_path)
 
-    if not hasattr(main_mod, "scan_kospi200"):
-        raise AttributeError(f"{main_module_path} 에 scan_kospi200() 없음")
+    if not hasattr(main_mod, "load_kospi200_pool"):
+        raise AttributeError(f"{main_module_path} 에 load_kospi200_pool() 없음")
 
-    # 넓은 후보 풀을 직접 요청. (구 시그니처 호환을 위해 실패 시 무인자 호출 후 슬라이스)
-    try:
-        df: pd.DataFrame = main_mod.scan_kospi200(top_n=pool_n)
-    except TypeError:
-        df = main_mod.scan_kospi200()
+    pool = main_mod.load_kospi200_pool()
+    if hasattr(main_mod, "_filter_valid_stock_codes"):
+        pool = main_mod._filter_valid_stock_codes(pool)
 
-    if df is None or df.empty:
-        raise RuntimeError("scan_kospi200() 가 빈 결과를 반환했습니다. KIS API 인증/네트워크를 확인하세요.")
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for stock_info in pool:
+        code = str(getattr(stock_info, "code", "")).strip().zfill(6)
+        name = str(getattr(stock_info, "name", "") or code).strip()
+        if not (code.isdigit() and len(code) == 6) or code in seen:
+            continue
+        seen.add(code)
+        rows.append({
+            "종목코드": code,
+            "종목명": name,
+            "ticker": code,
+            "company_name": name,
+        })
+        if len(rows) >= pool_n:
+            break
 
-    if pool_n < len(df):
-        df = df.head(pool_n)
-    df = df.reset_index(drop=True)
+    if not rows:
+        raise RuntimeError("KOSPI200 후보 풀이 비어 있습니다.")
 
-    # 컬럼명 정규화 (뒤 단계에서 영문 키 사용)
-    df["ticker"]       = df["종목코드"].astype(str).str.zfill(6)
-    df["company_name"] = df["종목명"].astype(str)
-
-    print(f"  선별 완료: {len(df)}개 종목")
-    for _, row in df.iterrows():
-        val = int(row.get("당일거래대금(원)", 0))
-        print(f"    {row['ticker']} {row['company_name']:12s}  거래대금 {val:>15,}원  등락률 {row.get('등락률(%)', 0):.2f}%")
-
+    df = pd.DataFrame(rows).reset_index(drop=True)
+    print(f"  로드 완료: {len(df)}개 종목")
     return df
 
 
 # ──────────────────────────────────────────────
-# STEP 2 : Transformer 상승확률 P(up) 전체 랭킹 + 수급 경향 필터
+# STEP 2 : Transformer 상승확률 P(up) 전체 랭킹 + Top10 수급 첨부
 # ──────────────────────────────────────────────
 #
 # 흐름:
@@ -149,8 +150,8 @@ def step1_scan_top_stocks(main_module_path: Path, pool_n: int) -> pd.DataFrame:
 #      - 지표는 Transformer 쪽 data.py 가 스스로 계산 (가공 parquet 불필요)
 #   2) predict_multiple(transformer_5y.pt, ticker_dfs) → 종목별 P(up)
 #   3) KOSPI200 전체를 P(up) 내림차순으로 랭킹
-#   4) 전체 랭킹 순서대로 최근 N거래일 외국인/기관 수급 경향 조회
-#   5) 수급 통과 종목 중 최종 Top10을 반환
+#   4) Transformer Top10에 최근 N거래일 외국인/기관 수급 경향 첨부
+#   5) Top10을 반환
 #
 # 누수 방지: 수급 조회 기준일 = 각 종목 OHLCV 의 마지막(가장 최근 완료된) 거래일.
 #            예측 시점에 실제 존재한 데이터만 사용하므로 미래 정보가 새지 않는다.
@@ -163,33 +164,119 @@ def _load_predict_module(predict_module_path: Path):
     return _import_from_path("_transformer_predict", predict_module_path)
 
 
-def _fetch_raw_ohlcv(ticker: str, lookback_days: int, as_of=None) -> pd.DataFrame | None:
-    """
-    pykrx 에서 단일 종목 raw OHLCV 를 받아 Transformer 입력 형식으로 반환.
-      - index: DatetimeIndex(Date), columns: Open/High/Low/Close/Volume
-      - 데이터 부족/실패 시 None
-    as_of(기준일) 이후 데이터는 받지 않는다(미래 정보 차단). 기본은 오늘(KST).
-    """
-    from pykrx import stock
+_kis_ohlcv_failures = 0
+_kis_ohlcv_disabled = False
+_kis_ohlcv_last_request = 0.0
+_local_ohlcv_cache: pd.DataFrame | None = None
 
+
+def _normalize_ohlcv(df: pd.DataFrame, end_date, source: str) -> pd.DataFrame | None:
+    keep = ["Open", "High", "Low", "Close", "Volume"]
+    if df is None or df.empty or not all(column in df.columns for column in keep):
+        return None
+    normalized = df[keep].copy()
+    normalized.index = pd.to_datetime(normalized.index, errors="coerce")
+    normalized = normalized.loc[normalized.index.notna()].sort_index()
+    normalized = normalized.loc[normalized.index.date <= end_date]
+    for column in keep:
+        normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
+    normalized = normalized.dropna(subset=keep)
+    normalized.attrs["source"] = source
+    return normalized if not normalized.empty else None
+
+
+def _fetch_kis_ohlcv(ticker: str, start, end) -> pd.DataFrame | None:
+    global _kis_ohlcv_last_request
+    token_manager = create_token_manager()
+    payload = None
+    last_error: Exception | None = None
+    for attempt in range(1, KIS_OHLCV_MAX_RETRIES + 1):
+        elapsed = time.monotonic() - _kis_ohlcv_last_request
+        if elapsed < KIS_OHLCV_REQUEST_SLEEP_SECONDS:
+            time.sleep(KIS_OHLCV_REQUEST_SLEEP_SECONDS - elapsed)
+        try:
+            response = token_manager.session.get(
+                f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+                headers=token_manager.auth_headers("FHKST03010100"),
+                params={
+                    "FID_COND_MRKT_DIV_CODE": "J",
+                    "FID_INPUT_ISCD": str(ticker).zfill(6),
+                    "FID_INPUT_DATE_1": start.strftime("%Y%m%d"),
+                    "FID_INPUT_DATE_2": end.strftime("%Y%m%d"),
+                    "FID_PERIOD_DIV_CODE": "D",
+                    "FID_ORG_ADJ_PRC": "1",
+                },
+                timeout=10,
+            )
+            _kis_ohlcv_last_request = time.monotonic()
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("rt_cd") != "0":
+                raise RuntimeError(payload.get("msg1") or payload.get("msg_cd") or "KIS OHLCV lookup failed")
+            break
+        except Exception as exc:
+            last_error = exc
+            payload = None
+            if attempt < KIS_OHLCV_MAX_RETRIES:
+                time.sleep(0.4 * attempt)
+
+    if payload is None:
+        raise RuntimeError(f"KIS OHLCV failed after {KIS_OHLCV_MAX_RETRIES} attempts: {last_error}")
+
+    rows = []
+    for item in payload.get("output2") or []:
+        date = pd.to_datetime(item.get("stck_bsop_date"), format="%Y%m%d", errors="coerce")
+        if pd.isna(date):
+            continue
+        rows.append({
+            "Date": date,
+            "Open": item.get("stck_oprc"),
+            "High": item.get("stck_hgpr"),
+            "Low": item.get("stck_lwpr"),
+            "Close": item.get("stck_clpr"),
+            "Volume": item.get("acml_vol"),
+        })
+    if not rows:
+        return None
+    return pd.DataFrame(rows).set_index("Date")
+
+
+def _fetch_local_ohlcv(ticker: str, start, end) -> pd.DataFrame | None:
+    global _local_ohlcv_cache
+    if not DEFAULT_LOCAL_OHLCV.exists():
+        return None
+    if _local_ohlcv_cache is None:
+        _local_ohlcv_cache = pd.read_parquet(DEFAULT_LOCAL_OHLCV)
+        _local_ohlcv_cache.index = pd.to_datetime(_local_ohlcv_cache.index, errors="coerce")
+
+    ticker_values = _local_ohlcv_cache["Ticker"].astype(str).str.zfill(6)
+    frame = _local_ohlcv_cache.loc[ticker_values.eq(str(ticker).zfill(6))].copy()
+    return frame.loc[(frame.index.date >= start) & (frame.index.date <= end)]
+
+
+def _fetch_raw_ohlcv(ticker: str, lookback_days: int, as_of=None) -> pd.DataFrame | None:
+    """Load recent OHLCV from KIS, then fall back to the bundled parquet."""
+    global _kis_ohlcv_disabled, _kis_ohlcv_failures
     end = (as_of or datetime.now(KST)).date()
     start = end - timedelta(days=lookback_days)
-    df = stock.get_market_ohlcv(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), ticker)
-    if df is None or df.empty:
-        return None
 
-    rename = {"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"}
-    df = df.rename(columns=rename)
-    keep = ["Open", "High", "Low", "Close", "Volume"]
-    if not all(c in df.columns for c in keep):
-        return None
-    df = df[keep].copy()
+    if not _kis_ohlcv_disabled:
+        try:
+            kis_df = _fetch_kis_ohlcv(ticker, start, end)
+            normalized = _normalize_ohlcv(kis_df, end, "kis") if kis_df is not None else None
+            if normalized is not None and not normalized.empty:
+                _kis_ohlcv_failures = 0
+                return normalized
+            raise RuntimeError("KIS OHLCV response was empty")
+        except Exception as exc:
+            _kis_ohlcv_failures += 1
+            print(f"  [{ticker}] KIS OHLCV 실패, 로컬 데이터 사용: {exc}")
+            if _kis_ohlcv_failures >= KIS_OHLCV_CIRCUIT_BREAKER:
+                _kis_ohlcv_disabled = True
+                print("  [WARN] KIS OHLCV 연속 실패로 이번 실행에서는 로컬 데이터를 우선합니다.")
 
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
-    df = df[df.index.date <= end]   # 기준일 이후 행 제거 (방어적 누수 차단)
-    return df
+    local_df = _fetch_local_ohlcv(ticker, start, end)
+    return _normalize_ohlcv(local_df, end, "local_parquet") if local_df is not None else None
 
 
 def _date_yyyymmdd(value) -> str:
@@ -360,6 +447,7 @@ def _base_step2_record(row: pd.Series) -> dict[str, Any]:
     record["pred_rank"] = float("nan")
     record["pred_pool_size"] = 0
     record["transformer_base_date"] = ""
+    record["ohlcv_source"] = ""
     record["prediction_status"] = "pending"
     record["prediction_error"] = ""
     return record
@@ -387,11 +475,10 @@ def step2_attach_transformer(
     supply_min_positive_days: int = 3,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     print(f"\n{'='*60}")
-    print("[STEP 2] Transformer P(up) 전체 랭킹 + 최근 수급 경향 필터")
+    print("[STEP 2] Transformer P(up) 전체 랭킹 + Top10 수급 첨부")
     print(f"  체크포인트 : {ckpt_path}")
     print(
-        f"  후보 {len(top_df)}개 전체 예측 → 전체 랭킹 수급 검사 "
-        f"→ 수급 통과 Top{final_max}"
+        f"  후보 {len(top_df)}개 전체 예측 → Transformer Top{final_max} 수급 조회"
     )
     print(
         f"  수급 조건: 최근 {supply_window}거래일, "
@@ -437,6 +524,7 @@ def step2_attach_transformer(
         ticker_dfs[ticker] = ohlcv
         base_dates[ticker] = ohlcv.index[-1]
         record["transformer_base_date"] = _date_iso(ohlcv.index[-1])
+        record["ohlcv_source"] = str(ohlcv.attrs.get("source", ""))
         record["prediction_status"] = "ready"
 
     scores: dict[str, float] = {}
@@ -495,16 +583,17 @@ def step2_attach_transformer(
         supply_df[col] = value
 
     success_indices = supply_df.index[supply_df["prediction_status"].eq("ok")].tolist()
+    supply_target_indices = success_indices[:final_max]
     debug_supply = bool(os.getenv("IP_DEBUG_SUPPLY"))
 
     token_manager = None
-    if success_indices:
+    if supply_target_indices:
         try:
             token_manager = create_token_manager()
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             print(f"  [WARN] 수급 조회용 KIS 토큰 생성 실패: {message}")
-            for idx in success_indices:
+            for idx in supply_target_indices:
                 for col, value in _empty_supply_result(
                     supply_window,
                     status="fetch_failed",
@@ -513,8 +602,8 @@ def step2_attach_transformer(
                     supply_df.at[idx, col] = value
 
     if token_manager is not None:
-        print("  전체 P(up) 랭킹 순서로 수급 검사:")
-        for idx in success_indices:
+        print(f"  Transformer Top{len(supply_target_indices)} 수급 조회:")
+        for idx in supply_target_indices:
             ticker = str(supply_df.at[idx, "ticker"]).zfill(6)
             try:
                 trend = _fetch_supply_trend(
@@ -547,14 +636,13 @@ def step2_attach_transformer(
             time.sleep(SUPPLY_REQUEST_SLEEP_SECONDS)
 
     final_df = (
-        supply_df.loc[supply_df["supply_pass"].astype(bool)]
-        .sort_values("p_up", ascending=False)
-        .head(final_max)
+        supply_df.loc[supply_target_indices]
+        .sort_values("pred_rank")
         .reset_index(drop=True)
     )
     final_df["ensemble_pred_return"] = pd.to_numeric(final_df["p_up"], errors="coerce")
 
-    print(f"\n  최종 Top{final_max}: {len(final_df)}개")
+    print(f"\n  Transformer 최종 Top{final_max}: {len(final_df)}개")
     for _, row in final_df.iterrows():
         print(
             f"    #{int(row['pred_rank']):>3}/{pred_pool_size} "
@@ -565,20 +653,32 @@ def step2_attach_transformer(
     return rank_df.reset_index(drop=True), supply_df.reset_index(drop=True), final_df
 
 
+def _build_top10_supply_csv(final_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "ticker", "company_name", "pred_rank", "pred_pool_size", "p_up",
+        "transformer_base_date", "ohlcv_source", "foreign_net_buy_sum",
+        "inst_net_buy_sum", "total_supply_net_buy", "foreign_positive_days",
+        "inst_positive_days", "supply_score", "supply_pass", "supply_window",
+        "supply_data_days", "supply_data_enough", "supply_base_start_date",
+        "supply_base_end_date", "supply_status", "supply_error", "종목코드", "종목명",
+    ]
+    output = final_df.copy()
+    for column in columns:
+        if column not in output.columns:
+            output[column] = pd.NA
+    return output[columns].reset_index(drop=True)
+
+
 # ──────────────────────────────────────────────
 # STEP 3 : 네이버 뉴스 크롤링
 # ──────────────────────────────────────────────
 
 import html as _html_module
 import re
-from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
 import requests as _requests
-
-KST = timezone(timedelta(hours=9))
-
 
 def _clean_html(text: str | None) -> str:
     if not text:
@@ -854,9 +954,9 @@ def step3_news_llm(
 def run(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
 
-    # ── STEP 1 : 거래대금 상위 후보 풀 스캔 ──
+    # ── STEP 1 : KOSPI200 전체 후보 풀 로드 ──
     try:
-        top_df = step1_scan_top_stocks(Path(args.main_module), args.candidate_pool)
+        top_df = step1_load_kospi200_pool(Path(args.main_module), args.candidate_pool)
     except Exception as e:
         print(f"\n[FATAL] STEP 1 실패: {e}", file=sys.stderr)
         return 1
@@ -866,7 +966,7 @@ def run(args: argparse.Namespace) -> int:
     top_df.to_csv(step1_csv, index=False, encoding="utf-8-sig")
     print(f"  저장: {step1_csv}")
 
-    # ── STEP 2 : Transformer P(up) 전체 랭킹 + 수급 경향 필터 ──
+    # ── STEP 2 : Transformer P(up) 전체 랭킹 + Top10 수급 첨부 ──
     try:
         all_rank_df, supply_checked_df, final_top10_df = step2_attach_transformer(
             top_df,
@@ -884,21 +984,26 @@ def run(args: argparse.Namespace) -> int:
     step2_rank_csv = output_dir / "step2_all_transformer_rank.csv"
     step2_supply_csv = output_dir / "step2_supply_checked.csv"
     step2_final_csv = output_dir / "step2_final_top10.csv"
+    step2_top10_supply_csv = output_dir / "step2_transformer_supply_demand.csv"
+    top10_supply_df = _build_top10_supply_csv(final_top10_df)
 
     all_rank_df.to_csv(step2_rank_csv, index=False, encoding="utf-8-sig")
     supply_checked_df.to_csv(step2_supply_csv, index=False, encoding="utf-8-sig")
     final_top10_df.to_csv(step2_final_csv, index=False, encoding="utf-8-sig")
+    top10_supply_df.to_csv(step2_top10_supply_csv, index=False, encoding="utf-8-sig")
     print(f"  저장: {step2_rank_csv}")
     print(f"  저장: {step2_supply_csv}")
     print(f"  저장: {step2_final_csv}")
+    print(f"  저장: {step2_top10_supply_csv}")
 
     # 기본 실행: 뉴스/LLM 미수행 (--run-news 일 때만 STEP 3 수행)
     if not args.run_news:
         print(f"\n{'='*60}")
-        print("[DONE] 기본 파이프라인 완료 — 뉴스/LLM 미실행 (--run-news 로 활성화)")
+        print("[DONE] 기본 파이프라인 완료 - 뉴스/LLM 미실행 (--run-news 로 활성화)")
         print(f"  전체 랭킹 : {step2_rank_csv}")
         print(f"  수급 확인 : {step2_supply_csv}")
         print(f"  최종 Top  : {step2_final_csv}")
+        print(f"  Top10 수급: {step2_top10_supply_csv}")
         return 0
 
     # ── STEP 3 : 뉴스 + LLM 감성 분석 (옵션) ──
@@ -934,7 +1039,7 @@ def run(args: argparse.Namespace) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="KIS 후보 풀 → Transformer P(up) 전체 랭킹 + 수급 경향 필터 → (옵션) 뉴스 LLM"
+        description="KOSPI200 전체 → Transformer P(up) 랭킹 → Top10 수급 첨부 → (옵션) 뉴스 LLM"
     )
     p.add_argument("--main-module",            default=str(DEFAULT_MAIN_MODULE),
                    help="main.py 경로 (기본: 같은 폴더의 main.py)")
@@ -945,11 +1050,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir",             default=str(DEFAULT_OUTPUT_DIR),
                    help="결과 저장 폴더")
     p.add_argument("--candidate-pool",         type=int, default=200,
-                   help="STEP1 거래대금 상위 후보 풀 크기 = 예측 대상 (기본 200 = KOSPI200 전 종목)")
+                   help="Transformer 예측 대상 KOSPI200 후보 수 (기본 200)")
     p.add_argument("--final-max",              type=int, default=10,
-                   help="수급 통과 후 최종 Top 개수 (기본 10)")
+                   help="Transformer P(up) 기준 최종 Top 개수 (기본 10)")
     p.add_argument("--ohlcv-lookback-days",    type=int, default=200,
-                   help="pykrx raw OHLCV 조회 기간(일). 지표 warmup+윈도우 확보용 (기본 200)")
+                   help="KIS/로컬 raw OHLCV 조회 기간(일, 기본 200)")
     p.add_argument("--supply-window",          type=int, default=5,
                    help="수급 경향 조회 거래일 수 (기본 최근 5거래일)")
     p.add_argument("--supply-min-positive-days", type=int, default=3,

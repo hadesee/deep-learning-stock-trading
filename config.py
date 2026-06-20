@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import requests
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 
 BASE_URL = "https://openapivts.koreainvestment.com:29443"
@@ -19,6 +22,7 @@ REQUEST_TIMEOUT_SECONDS = 10
 MODULE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = MODULE_DIR.parent
 ENV_PATHS = (PROJECT_ROOT / ".env", MODULE_DIR / ".env")
+TOKEN_CACHE_FILE = MODULE_DIR / "kis_token_cache.json"
 
 
 class KISAuthError(RuntimeError):
@@ -50,17 +54,20 @@ class KISTokenManager:
         if self._access_token and time.monotonic() < self._expires_at_monotonic:
             return self._access_token
 
+        cached_token = self._load_cached_token()
+        if cached_token:
+            return cached_token
+
         token_data = self._issue_token()
         access_token = token_data.get("access_token")
         if not access_token:
             raise KISAuthError(f"Token response did not include access_token: {token_data}")
 
         expires_in = _to_int(token_data.get("expires_in"), default=86400)
+        cache_ttl = max(expires_in - TOKEN_EXPIRY_BUFFER_SECONDS, 60)
         self._access_token = access_token
-        self._expires_at_monotonic = time.monotonic() + max(
-            expires_in - TOKEN_EXPIRY_BUFFER_SECONDS,
-            60,
-        )
+        self._expires_at_monotonic = time.monotonic() + cache_ttl
+        self._save_cached_token(access_token, time.time() + cache_ttl)
         return self._access_token
 
     def auth_headers(self, tr_id: str) -> dict[str, str]:
@@ -104,19 +111,76 @@ class KISTokenManager:
 
         return data
 
+    def _credentials_cache_key(self) -> str:
+        return hashlib.sha256(self.credentials.app_key.encode("utf-8")).hexdigest()
+
+    def _load_cached_token(self) -> str | None:
+        try:
+            data = json.loads(TOKEN_CACHE_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+        app_key_hash = data.get("app_key_hash")
+        if app_key_hash and app_key_hash != self._credentials_cache_key():
+            return None
+        if not app_key_hash and data.get("url_base") not in (None, self.base_url):
+            return None
+
+        token = data.get("access_token")
+        expires_at_epoch = _to_float(data.get("expires_at_epoch"), default=0.0)
+        if not expires_at_epoch and data.get("expired_at"):
+            expires_at_epoch = _parse_epoch(data.get("expired_at"))
+        ttl = expires_at_epoch - time.time()
+        if not token or ttl <= TOKEN_EXPIRY_BUFFER_SECONDS:
+            return None
+
+        self._access_token = str(token)
+        self._expires_at_monotonic = time.monotonic() + ttl
+        return self._access_token
+
+    def _save_cached_token(self, access_token: str, expires_at_epoch: float) -> None:
+        data = {
+            "access_token": access_token,
+            "expires_at_epoch": expires_at_epoch,
+            "app_key_hash": self._credentials_cache_key(),
+        }
+        try:
+            TOKEN_CACHE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+
+def _first_value(*values: str | None) -> str | None:
+    return next((value.strip() for value in values if value and value.strip()), None)
+
 
 def load_credentials() -> KISCredentials:
-    loaded_env = False
+    file_env: dict[str, str | None] = {}
     for env_path in ENV_PATHS:
         if env_path.exists():
-            load_dotenv(env_path, override=True)
-            loaded_env = True
+            file_env.update(dotenv_values(env_path))
 
-    if not loaded_env:
-        load_dotenv()
+    if not file_env:
+        load_dotenv(override=False)
 
-    app_key = os.getenv("APP_KEY")
-    app_secret = os.getenv("APP_SECRET")
+    # The pipeline targets the KIS virtual-trading host. Explicit process values
+    # from the Node runner must win over generic values in a checked-in/local env.
+    app_key = _first_value(
+        os.getenv("KIS_MOCK_APP_KEY"),
+        os.getenv("KIS_APP_KEY"),
+        os.getenv("APP_KEY"),
+        file_env.get("KIS_MOCK_APP_KEY"),
+        file_env.get("KIS_APP_KEY"),
+        file_env.get("APP_KEY"),
+    )
+    app_secret = _first_value(
+        os.getenv("KIS_MOCK_APP_SECRET"),
+        os.getenv("KIS_APP_SECRET"),
+        os.getenv("APP_SECRET"),
+        file_env.get("KIS_MOCK_APP_SECRET"),
+        file_env.get("KIS_APP_SECRET"),
+        file_env.get("APP_SECRET"),
+    )
 
     missing = [name for name, value in {"APP_KEY": app_key, "APP_SECRET": app_secret}.items() if not value]
     if missing:
@@ -125,8 +189,14 @@ def load_credentials() -> KISCredentials:
     return KISCredentials(app_key=app_key or "", app_secret=app_secret or "")
 
 
+_token_manager: KISTokenManager | None = None
+
+
 def create_token_manager() -> KISTokenManager:
-    return KISTokenManager(load_credentials())
+    global _token_manager
+    if _token_manager is None:
+        _token_manager = KISTokenManager(load_credentials())
+    return _token_manager
 
 
 def _to_int(value: Any, default: int) -> int:
@@ -134,3 +204,17 @@ def _to_int(value: Any, default: int) -> int:
         return int(float(str(value).replace(",", "").strip()))
     except (TypeError, ValueError):
         return default
+
+
+def _to_float(value: Any, default: float) -> float:
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_epoch(value: Any) -> float:
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
