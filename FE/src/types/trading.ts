@@ -36,7 +36,11 @@ export type PipelineNewsItem = {
   pub_date: string;
   source: string;
   title: string;
+  description?: string;
   url?: string;
+  sentiment?: PipelineSentimentLabel;
+  sentiment_ko?: string;
+  sentiment_reason?: string;
 };
 
 export type PipelineOutputRow = {

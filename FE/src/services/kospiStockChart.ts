@@ -10,7 +10,6 @@ export type ResolvedStockChartBundle = StockChartBundle & {
 };
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
-const ENABLE_MOCK_CHART_FALLBACK = import.meta.env.VITE_ENABLE_MOCK_CHART_FALLBACK === "true";
 const CLIENT_CACHE_TTL_MS = 60_000;
 const bundleCache = new Map<string, { bundle: StockChartBundle; cachedAt: number }>();
 
@@ -90,10 +89,6 @@ export async function getKospiStockChartBundle(
     }
 
     const warning = error instanceof Error ? error.message : "KIS chart request failed.";
-    if (!ENABLE_MOCK_CHART_FALLBACK) {
-      throw new Error(warning);
-    }
-
     if (import.meta.env.DEV) {
       console.warn("KIS stock chart API unavailable. Falling back to mock chart data.", error);
     }

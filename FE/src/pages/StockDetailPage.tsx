@@ -1,36 +1,17 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { StockChartPanel } from "../components/market/stock-chart";
-import { DashboardSkeleton } from "../components/market/DashboardSkeleton";
-import { ErrorView } from "../components/common/StatusView";
-import { useAsyncData } from "../hooks/useAsyncData";
 import { usePageTitle } from "../hooks/usePageTitle";
 import {
-  fetchMarketDashboardData,
   fetchStockAnalysis,
   getMarketDashboardData,
   readWatchlistCodes,
-  runStockNewsAnalysis,
   writeWatchlistCodes,
 } from "../services/tradingData";
-import { describeAiSummary, hasLlmSentiment } from "../utils/aiSignal";
-import type {
-  MarketDashboardData,
-  MarketDirection,
-  MarketIndexSnapshot,
-  PipelineOutputRow,
-  StockQuote,
-} from "../types/trading";
-
-type DetailData = {
-  analysis: PipelineOutputRow | null;
-  dashboard: MarketDashboardData;
-};
-
-function finiteNumber(value: unknown): number | null {
-  const parsed = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
+import { getAiCandidate } from "../data/aiCandidates";
+import type { AiCandidate, AiNews } from "../data/aiCandidates";
+import { rowToCandidate } from "../data/pipelineAdapter";
+import type { MarketDirection, StockQuote } from "../types/trading";
 
 function formatWon(value: number) {
   return `${Math.round(value).toLocaleString("ko-KR")}원`;
@@ -40,21 +21,12 @@ function formatRate(value: number) {
   return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
-function formatCompactWon(value: number) {
-  if (value >= 1_000_000_000_000) {
-    return `${Math.round(value / 100_000_000_000) / 10}조원`;
-  }
-
-  if (value >= 100_000_000) {
-    return `${Math.round(value / 100_000_000).toLocaleString("ko-KR")}억원`;
-  }
-
-  return formatWon(value);
-}
-
-function formatSignedVolume(value: number) {
-  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
-  return `${sign}${Math.abs(value).toLocaleString("ko-KR")}주`;
+/** Net-buy won amounts come in raw KRW; show them in 억원 for readability. */
+function formatEok(won: number) {
+  const abs = Math.abs(won / 100_000_000);
+  const value =
+    abs >= 10 ? Math.round(abs).toLocaleString("ko-KR") : abs >= 1 ? abs.toFixed(1) : abs > 0 ? abs.toFixed(2) : "0";
+  return `${won > 0 ? "+" : won < 0 ? "-" : ""}${value}억원`;
 }
 
 function directionLabel(direction: MarketDirection) {
@@ -65,167 +37,545 @@ function changeTone(value: number) {
   return value > 0 ? "is-positive-text" : value < 0 ? "is-negative-text" : undefined;
 }
 
-function sentimentKo(label: StockQuote["sentimentLabel"]) {
-  return label === "POSITIVE" ? "긍정" : label === "NEGATIVE" ? "부정" : "중립";
+/** Brand-consistent tone for a sentiment label (KR market: 상승 red / 하락 blue). */
+function sentimentTone(label: string) {
+  const upper = label.toUpperCase();
+  if (upper === "POSITIVE" || upper === "BULLISH") return "up";
+  if (upper === "NEGATIVE" || upper === "BEARISH") return "down";
+  return "neutral";
 }
 
-/** The KOSPI index drives the index-shock leg of the risk gate. */
-function findKospiIndex(indices: MarketIndexSnapshot[]): MarketIndexSnapshot | undefined {
-  return (
-    indices.find((index) => /코스피200|kospi ?200/i.test(`${index.name}${index.symbol}`)) ??
-    indices.find((index) => /코스피|kospi/i.test(`${index.name}${index.symbol}`)) ??
-    indices[0]
-  );
+function clampPercent(value: number) {
+  return Math.max(0, Math.min(100, value));
 }
 
-type RiskCondition = {
-  detail: string;
-  label: string;
-  triggered: boolean;
+function parseSentimentTally(tally: string) {
+  const result = { negative: 0, neutral: 0, positive: 0 };
+  const matches = tally.matchAll(/(긍정|부정|중립|혼합)\s*(\d+)\s*건/g);
+  for (const match of matches) {
+    const count = Number(match[2]);
+    if (match[1] === "긍정") result.positive = count;
+    if (match[1] === "부정") result.negative = count;
+    if (match[1] === "중립" || match[1] === "혼합") result.neutral += count;
+  }
+  return result;
+}
+
+function formatRatio(count: number, total: number) {
+  return total > 0 ? `${Math.round((count / total) * 100)}%` : "0%";
+}
+
+type NewsTone = "negative" | "neutral" | "positive";
+
+type ClassifiedNews = AiNews & {
+  tone: NewsTone;
+  toneLabel: string;
+  toneReason?: string;
 };
 
-/**
- * Mirrors the automated-trading risk gate: entry is restricted when at least two
- * of {index ≤ -3%, foreign net-sell, confidence < 70%} hold. Evaluating it live
- * for the stock — instead of just stating the rule — is the trust-building part.
- */
-function evaluateRiskGate(stock: StockQuote, kospi: MarketIndexSnapshot | undefined): {
-  blocked: boolean;
-  conditions: RiskCondition[];
-} {
-  const hasConfidence = stock.confidence > 0;
-  const conditions: RiskCondition[] = [
-    {
-      label: "지수 급락 (KOSPI -3% 이하)",
-      triggered: kospi !== undefined && kospi.changeRate <= -3,
-      detail: kospi ? `${kospi.name} ${formatRate(kospi.changeRate)}` : "지수 데이터 없음",
-    },
-    {
-      label: "외국인 순매도",
-      triggered: stock.investorFlow.foreign < 0,
-      detail:
-        stock.investorFlow.foreign === 0
-          ? "수급 데이터 미연동"
-          : `외국인 ${formatSignedVolume(stock.investorFlow.foreign)}`,
-    },
-    {
-      label: "신뢰도 70% 미만",
-      triggered: !hasConfidence || stock.confidence < 0.7,
-      detail: hasConfidence ? `신뢰도 ${Math.round(stock.confidence * 100)}%` : "LLM 신뢰도 미산출",
-    },
-  ];
+const NEWS_TONE_META: Record<NewsTone, { label: string; shortLabel: string }> = {
+  positive: { label: "긍정 뉴스", shortLabel: "긍정" },
+  neutral: { label: "중립 뉴스", shortLabel: "중립" },
+  negative: { label: "부정 뉴스", shortLabel: "부정" },
+};
+
+const POSITIVE_NEWS_KEYWORDS = [
+  "상승",
+  "오른",
+  "급등",
+  "강세",
+  "호재",
+  "매수",
+  "추천",
+  "목표가",
+  "상향",
+  "성장",
+  "수주",
+  "흑자",
+  "개선",
+  "최대",
+  "돌파",
+  "호실적",
+  "기대",
+  "수혜",
+  "확대",
+  "친환경",
+  "슈퍼사이클",
+  "유망",
+  "buy",
+];
+
+const NEGATIVE_NEWS_KEYWORDS = [
+  "하락",
+  "급락",
+  "약세",
+  "악재",
+  "담합",
+  "구속",
+  "수사",
+  "적자",
+  "부진",
+  "하회",
+  "리스크",
+  "매도",
+  "하향",
+  "감소",
+  "침체",
+  "우려",
+  "조정",
+  "손실",
+  "중단",
+  "불확실",
+  "과열",
+  "부담",
+];
+
+function newsToneFromSentiment(label: string | undefined): NewsTone | null {
+  const normalized = String(label ?? "").toUpperCase();
+  if (normalized === "POSITIVE" || normalized === "BULLISH" || normalized.includes("긍정")) return "positive";
+  if (normalized === "NEGATIVE" || normalized === "BEARISH" || normalized.includes("부정")) return "negative";
+  if (normalized === "NEUTRAL" || normalized.includes("중립")) return "neutral";
+  return null;
+}
+
+function keywordScore(text: string, keywords: string[]) {
+  const lowered = text.toLowerCase();
+  return keywords.reduce((score, keyword) => score + (lowered.includes(keyword.toLowerCase()) ? 1 : 0), 0);
+}
+
+function classifyNews(item: AiNews): ClassifiedNews {
+  const llmTone = newsToneFromSentiment(item.sentiment ?? item.sentimentKo);
+  if (llmTone) {
+    return {
+      ...item,
+      tone: llmTone,
+      toneLabel: NEWS_TONE_META[llmTone].shortLabel,
+      toneReason: item.sentimentReason,
+    };
+  }
+
+  const text = `${item.title} ${item.description}`;
+  const positiveScore = keywordScore(text, POSITIVE_NEWS_KEYWORDS);
+  const negativeScore = keywordScore(text, NEGATIVE_NEWS_KEYWORDS);
+  const tone: NewsTone =
+    positiveScore > negativeScore ? "positive" : negativeScore > positiveScore ? "negative" : "neutral";
 
   return {
-    blocked: conditions.filter((condition) => condition.triggered).length >= 2,
-    conditions,
+    ...item,
+    tone,
+    toneLabel: NEWS_TONE_META[tone].shortLabel,
   };
 }
 
-function StatRow({ label, value, tone }: { label: string; value: string; tone?: string }) {
-  return (
-    <span>
-      {label} <strong className={tone}>{value}</strong>
-    </span>
-  );
+function groupedNews(news: AiNews[]) {
+  const classified = news.map(classifyNews);
+  return (["positive", "neutral", "negative"] as const)
+    .map((tone) => ({
+      tone,
+      ...NEWS_TONE_META[tone],
+      items: classified.filter((item) => item.tone === tone),
+    }))
+    .filter((group) => group.items.length > 0);
 }
 
-function FactorList({ items, tone }: { items: string[]; tone: "positive" | "negative" | "neutral" }) {
-  if (items.length === 0) {
-    return <p className="factor-empty">해당 근거가 제시되지 않았습니다.</p>;
-  }
+/** Circular 0-100 conviction gauge — the headline "how strong is this pick" signal. */
+function ScoreGauge({ score, tone }: { score: number; tone: string }) {
+  const pct = Math.max(0, Math.min(100, score)) / 100;
+  const radius = 52;
+  const circ = 2 * Math.PI * radius;
+  const dash = circ * pct;
 
   return (
-    <ul className={`factor-list factor-list--${tone}`}>
-      {items.map((item, index) => (
-        <li key={`${tone}-${index}`}>{item}</li>
-      ))}
-    </ul>
-  );
-}
-
-function FlowBars({ flow }: { flow: StockQuote["investorFlow"] }) {
-  const hasFlow = flow.personal !== 0 || flow.foreign !== 0 || flow.institution !== 0;
-  if (!hasFlow) {
-    return (
-      <p className="flow-empty">
-        투자자별 순매수 데이터가 아직 연결되지 않았습니다. 실전 시세(KIS_ENV=real) 연동 시 표시됩니다.
-      </p>
-    );
-  }
-
-  const max = Math.max(...[flow.personal, flow.foreign, flow.institution].map((value) => Math.abs(value)), 1);
-
-  return (
-    <div className="flow-bars" aria-label="개인 외국인 기관 순매수량">
-      {([
-        ["개인", flow.personal],
-        ["외국인", flow.foreign],
-        ["기관", flow.institution],
-      ] as const).map(([label, value]) => (
-        <div className="flow-bar" key={label}>
-          <span>{label}</span>
-          <div>
-            <i
-              className={value >= 0 ? "is-positive" : "is-negative"}
-              style={{ width: `${Math.max((Math.abs(value) / max) * 100, 8)}%` }}
-            />
-          </div>
-          <strong className={value >= 0 ? "is-positive-text" : "is-negative-text"}>
-            {formatSignedVolume(value)}
-          </strong>
-        </div>
-      ))}
+    <div className={`score-gauge score-gauge--${tone}`} role="img" aria-label={`종합 점수 ${Math.round(score)}점`}>
+      <svg viewBox="0 0 120 120">
+        <circle className="score-gauge__track" cx="60" cy="60" r={radius} />
+        <circle
+          className="score-gauge__value"
+          cx="60"
+          cy="60"
+          r={radius}
+          strokeDasharray={`${dash} ${circ - dash}`}
+          strokeDashoffset={circ / 4}
+        />
+      </svg>
+      <div className="score-gauge__center">
+        <strong>{Math.round(score)}</strong>
+        <span>종합점수</span>
+      </div>
     </div>
   );
 }
 
-const initialDetailData = (): DetailData => ({ analysis: null, dashboard: getMarketDashboardData() });
+function MetricTile({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: string }) {
+  return (
+    <div className="metric-tile">
+      <span className="metric-tile__label">{label}</span>
+      <strong className={`metric-tile__value ${tone ?? ""}`}>{value}</strong>
+      {sub ? <small className="metric-tile__sub">{sub}</small> : null}
+    </div>
+  );
+}
 
-async function loadDetailData(code: string, signal: AbortSignal): Promise<DetailData> {
-  const [dashboard, analysis] = await Promise.all([
-    fetchMarketDashboardData(signal),
-    fetchStockAnalysis(code, signal),
-  ]);
+function ReportKpiCard({
+  icon,
+  label,
+  sub,
+  tone,
+  value,
+}: {
+  icon: string;
+  label: string;
+  sub: string;
+  tone?: string;
+  value: string;
+}) {
+  return (
+    <article className="report-kpi-card">
+      <span className="report-kpi-card__icon" aria-hidden="true">{icon}</span>
+      <small>{label}</small>
+      <strong className={tone}>{value}</strong>
+      <span>{sub}</span>
+    </article>
+  );
+}
 
-  return { analysis, dashboard };
+function EvidenceReportDashboard({ candidate }: { candidate: AiCandidate }) {
+  const parsed = parseSentimentTally(candidate.newsSentimentTally);
+  const parsedTotal = parsed.positive + parsed.neutral + parsed.negative;
+  const uncategorized = Math.max(candidate.newsCount - parsedTotal, 0);
+  const neutralCount = parsed.neutral + uncategorized;
+  const total = parsed.positive + neutralCount + parsed.negative || candidate.newsCount;
+  const positivePct = total > 0 ? (parsed.positive / total) * 100 : 0;
+  const neutralPct = total > 0 ? (neutralCount / total) * 100 : 0;
+  const negativePct = total > 0 ? (parsed.negative / total) * 100 : 0;
+  const tone = sentimentTone(candidate.finalSentiment);
+  const supplyMaxAbs = Math.max(Math.abs(candidate.foreignNetBuy), Math.abs(candidate.instNetBuy), Math.abs(candidate.totalSupplyNetBuy), 1);
+  const supplyDays = candidate.foreignPositiveDays + candidate.instPositiveDays;
+  const supplyDayTotal = Math.max(candidate.supplyWindow * 2, 1);
+  const supplyParticipationScore = clampPercent((supplyDays / supplyDayTotal) * 100);
+  const signalBars = [
+    {
+      label: "Transformer",
+      value: candidate.pUp * 100,
+      tone: candidate.pUp >= 0.5 ? "up" : "down",
+    },
+    {
+      label: "뉴스",
+      value: candidate.newsOverallScore * 10,
+      tone: candidate.newsOverallScore >= 5 ? "up" : "down",
+    },
+    {
+      label: "수급",
+      value: supplyParticipationScore,
+      tone: candidate.totalSupplyNetBuy >= 0 ? "up" : "down",
+    },
+    {
+      label: "최종",
+      value: candidate.finalCombinedScore,
+      tone,
+    },
+  ];
+
+  return (
+    <section className="detail-card report-dashboard reco-reveal" style={{ animationDelay: "240ms" }}>
+      <header className="report-dashboard__head">
+        <div>
+          <h2>AI 근거 리포트 대시보드</h2>
+          <p className="detail-card-sub">모델 예측, 뉴스 감성, 수급 흐름을 한 화면에서 비교합니다.</p>
+        </div>
+        <strong className={`report-dashboard__verdict tone-${tone}`}>{candidate.finalSentimentKo}</strong>
+      </header>
+
+      <div className="report-kpi-grid">
+        <ReportKpiCard
+          icon="AI"
+          label="최종 결합 점수"
+          value={`${Math.round(candidate.finalCombinedScore)}점`}
+          sub="모델+뉴스+수급"
+          tone={tone === "up" ? "is-positive-text" : tone === "down" ? "is-negative-text" : undefined}
+        />
+        <ReportKpiCard
+          icon="P"
+          label="상승확률"
+          value={`${(candidate.pUp * 100).toFixed(1)}%`}
+          sub={`${candidate.rank}위 / ${candidate.poolSize}개`}
+          tone={candidate.pUp >= 0.5 ? "is-positive-text" : "is-negative-text"}
+        />
+        <ReportKpiCard
+          icon="N"
+          label="뉴스 분석"
+          value={`${candidate.newsCount}건`}
+          sub={`${candidate.newsOverallScore.toFixed(1)} / 10`}
+          tone={candidate.newsOverallScore >= 5 ? "is-positive-text" : "is-negative-text"}
+        />
+        <ReportKpiCard
+          icon="F"
+          label="수급 합산"
+          value={formatEok(candidate.totalSupplyNetBuy)}
+          sub={`매수 우위 ${supplyDays}/${supplyDayTotal}일`}
+          tone={candidate.totalSupplyNetBuy >= 0 ? "is-positive-text" : "is-negative-text"}
+        />
+      </div>
+
+      <div className="report-chart-grid">
+        <article className="report-chart-card">
+          <div className="report-chart-card__head">
+            <strong>뉴스 감성 비율</strong>
+            <span>{candidate.newsOverallScore.toFixed(1)} / 10</span>
+          </div>
+          <div className="sentiment-donut-wrap">
+            <div
+              className="sentiment-donut"
+              style={{
+                background: `conic-gradient(var(--news-sentiment-positive) 0 ${positivePct}%, var(--report-neutral) ${positivePct}% ${
+                  positivePct + neutralPct
+                }%, var(--news-sentiment-negative) ${positivePct + neutralPct}% 100%)`,
+              }}
+              role="img"
+              aria-label={`긍정 ${parsed.positive}건, 중립 ${parsed.neutral}건, 부정 ${parsed.negative}건`}
+            >
+              <span>{candidate.newsCount}</span>
+              <small>뉴스</small>
+            </div>
+            <div className="sentiment-legend">
+              <span><i className="is-positive" />긍정 {parsed.positive}건 · {formatRatio(parsed.positive, total)}</span>
+              <span><i className="is-neutral" />중립 {neutralCount}건 · {formatRatio(neutralCount, total)}</span>
+              <span><i className="is-negative" />부정 {parsed.negative}건 · {formatRatio(parsed.negative, total)}</span>
+            </div>
+          </div>
+        </article>
+
+        <article className="report-chart-card">
+          <div className="report-chart-card__head">
+            <strong>카테고리별 근거 점수</strong>
+            <span>0-100</span>
+          </div>
+          <div className="report-bar-chart" aria-label="근거 점수 막대 차트">
+            {signalBars.map((bar) => (
+              <div className="report-bar" key={bar.label}>
+                <span>{bar.label}</span>
+                <div className="report-bar__track">
+                  <i className={`report-bar__fill report-bar__fill--${bar.tone}`} style={{ width: `${Math.max(4, clampPercent(bar.value))}%` }} />
+                </div>
+                <strong>{Math.round(bar.value)}</strong>
+              </div>
+            ))}
+          </div>
+        </article>
+      </div>
+
+      <div className="report-supply-panel">
+        <div className="report-supply-panel__summary">
+          <MetricTile
+            label="외국인+기관 합산"
+            value={formatEok(candidate.totalSupplyNetBuy)}
+            sub="최근 누적 순매수 금액"
+            tone={candidate.totalSupplyNetBuy >= 0 ? "is-positive-text" : "is-negative-text"}
+          />
+          <MetricTile
+            label="매수 우위 일수"
+            value={`${supplyDays}/${supplyDayTotal}일`}
+            sub="외국인·기관 합산 관찰"
+            tone={supplyDays >= supplyDayTotal / 2 ? "is-positive-text" : "is-negative-text"}
+          />
+        </div>
+        <div className="supply-grid">
+          <SupplyRow
+            label="외국인"
+            won={candidate.foreignNetBuy}
+            days={candidate.foreignPositiveDays}
+            maxAbs={supplyMaxAbs}
+            window={candidate.supplyWindow}
+          />
+          <SupplyRow
+            label="기관"
+            won={candidate.instNetBuy}
+            days={candidate.instPositiveDays}
+            maxAbs={supplyMaxAbs}
+            window={candidate.supplyWindow}
+          />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SupplyRow({
+  days,
+  label,
+  maxAbs,
+  window,
+  won,
+}: {
+  days: number;
+  label: string;
+  maxAbs: number;
+  window: number;
+  won: number;
+}) {
+  const tone = won >= 0 ? "is-positive-text" : "is-negative-text";
+  const amountFill = maxAbs > 0 ? Math.max(8, Math.min(100, (Math.abs(won) / maxAbs) * 100)) : 0;
+  const dayFill = clampPercent((days / Math.max(window, 1)) * 100);
+  return (
+    <div className="supply-row">
+      <span className="supply-row__label">{label}</span>
+      <div className="supply-row__bar">
+        <i className={won >= 0 ? "is-positive" : "is-negative"} style={{ width: `${amountFill}%` }} />
+      </div>
+      <strong className={`supply-row__won ${tone}`}>{formatEok(won)}</strong>
+      <small className="supply-row__days">매수 우위 {days}/{window}일</small>
+      <div className="supply-row__daysbar" aria-hidden="true">
+        <i style={{ width: `${Math.max(dayFill, 4)}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function AiRecommendation({ candidate }: { candidate: AiCandidate }) {
+  const tone = sentimentTone(candidate.finalSentiment);
+  const newsGroups = groupedNews(candidate.news);
+
+  return (
+    <>
+      <section className="detail-card ai-reco reco-reveal" style={{ animationDelay: "40ms" }}>
+        <div className="ai-reco__head">
+          <span className="ai-reco__eyebrow">왜 이 종목을 추천했나</span>
+          <h2>
+            AI는 이 종목을 <em className={`tone-${tone}`}>{candidate.finalSentimentKo}</em> 후보로 선정했습니다
+          </h2>
+        </div>
+
+        <div className="reco-grid">
+          <ScoreGauge score={candidate.finalCombinedScore} tone={tone} />
+          <div className="metric-tiles">
+            <MetricTile
+              label="익일 상승확률"
+              value={`${(candidate.pUp * 100).toFixed(1)}%`}
+              sub="Transformer 예측"
+              tone={candidate.pUp >= 0.5 ? "is-positive-text" : "is-negative-text"}
+            />
+            <MetricTile
+              label="전체 예측순위"
+              value={candidate.rank > 0 ? `${candidate.rank}위` : "—"}
+              sub={candidate.poolSize > 0 ? `${candidate.poolSize}개 중` : undefined}
+            />
+            <MetricTile
+              label="뉴스 점수"
+              value={`${candidate.newsOverallScore.toFixed(1)} / 10`}
+              sub={candidate.newsSentimentTally || `뉴스 ${candidate.newsCount}건`}
+            />
+          </div>
+        </div>
+
+        <div className="reco-reason">
+          <span className="reco-reason__tag">핵심 근거</span>
+          <p>
+            {[candidate.summary, candidate.tradingInsight].filter(Boolean).join(" ")}
+          </p>
+        </div>
+      </section>
+
+      <EvidenceReportDashboard candidate={candidate} />
+
+      <section className="detail-card reco-reveal" style={{ animationDelay: "440ms" }}>
+        <h2>분석에 사용한 뉴스 ({candidate.news.length})</h2>
+        {candidate.news.length > 0 ? (
+          <div className="ai-news-groups">
+            {newsGroups.map((group) => (
+              <section className={`ai-news-group ai-news-group--${group.tone}`} key={group.tone}>
+                <div className={`ai-news-group__head is-${group.tone}`}>
+                  <strong>{group.label}</strong>
+                  <span>{group.items.length}건</span>
+                </div>
+                <ul className="ai-news-list">
+                  {group.items.map((item) => (
+                    <li key={`${group.tone}-${item.index}`}>
+                      <a className={`ai-news-list__link is-${item.tone}`} href={item.url} target="_blank" rel="noopener noreferrer">
+                        <span className="ai-news-list__top">
+                          <span className="ai-news-list__title">{item.title}</span>
+                          <span className={`ai-news-badge is-${item.tone}`}>{item.toneLabel}</span>
+                        </span>
+                        {item.description ? <span className="ai-news-list__desc">{item.description}</span> : null}
+                        {item.toneReason ? <span className="ai-news-list__reason">{item.toneReason}</span> : null}
+                        <small className="ai-news-list__meta">
+                          {item.source} · {item.pubDate?.slice(0, 10)}
+                        </small>
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ))}
+          </div>
+        ) : (
+          <p className="factor-empty">분석에 사용된 뉴스 항목이 없습니다.</p>
+        )}
+      </section>
+    </>
+  );
 }
 
 export function StockDetailPage() {
   const { code = "" } = useParams<{ code: string }>();
-  const [seed] = useState(initialDetailData);
-  const { data, error, isLoading, isRefreshing, reload } = useAsyncData(
-    (signal) => loadDetailData(code, signal),
-    [code],
-    seed,
-  );
+  const normalized = code.replace(/\D/g, "").padStart(6, "0").slice(-6);
 
-  const detail = data ?? seed;
-  const stock =
-    detail.dashboard.stocks.find((item) => item.code === code) ??
-    detail.dashboard.watchlist.find((item) => item.code === code);
+  const dashboard = getMarketDashboardData();
+  const stock: StockQuote | undefined =
+    dashboard.stocks.find((item) => item.code === normalized) ??
+    dashboard.watchlist.find((item) => item.code === normalized);
 
-  usePageTitle(stock ? `${stock.name} ${stock.code}` : "종목 상세");
+  // Bundled output shows instantly; the live pipeline result (after a real run)
+  // overrides it once fetched.
+  const [candidate, setCandidate] = useState<AiCandidate | undefined>(() => getAiCandidate(normalized));
+  const [isSyncing, setSyncing] = useState(false);
+  const [isLive, setIsLive] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const controller = new AbortController();
+    setSyncing(true);
+    fetchStockAnalysis(normalized, controller.signal)
+      .then((row) => {
+        if (active && row) {
+          setCandidate(rowToCandidate(row));
+          setIsLive(true);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (active) {
+          setSyncing(false);
+        }
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [normalized]);
+
+  usePageTitle(candidate ? `${candidate.companyName} ${normalized}` : stock ? `${stock.name} ${stock.code}` : "종목 상세");
 
   const [watchCodes, setWatchCodes] = useState<string[]>(() => readWatchlistCodes() ?? []);
-  const [newsAnalysisState, setNewsAnalysisState] = useState<{
-    error: string;
-    isRunning: boolean;
-    message: string;
-  }>({ error: "", isRunning: false, message: "" });
   useEffect(() => {
     writeWatchlistCodes(watchCodes);
   }, [watchCodes]);
 
-  if (isLoading) {
-    return <DashboardSkeleton />;
+  const displayName = candidate?.companyName ?? stock?.name ?? normalized;
+  const isWatched = watchCodes.includes(normalized);
+
+  function toggleWatch() {
+    setWatchCodes((current) =>
+      current.includes(normalized) ? current.filter((item) => item !== normalized) : [normalized, ...current],
+    );
   }
 
-  if (!stock) {
+  if (!candidate && !stock) {
     return (
       <main className="page-status">
-        <ErrorView
-          message={`종목코드 ${code || "(없음)"}에 해당하는 데이터가 없습니다. 대시보드에서 다시 선택해 주세요.`}
-        />
+        <div className="status-view">
+          <strong>분석 데이터가 없습니다</strong>
+          <p>종목코드 {normalized || "(없음)"}에 대한 AI 분석 결과를 찾을 수 없습니다.</p>
+        </div>
         <p className="detail-back-row">
           <Link className="detail-back-link" to="/dashboard">
             ← 실시간 대시보드로 돌아가기
@@ -235,297 +585,62 @@ export function StockDetailPage() {
     );
   }
 
-  const row = detail.analysis;
-  const result = row?.result;
-  const modelRow = row?.input_row;
-  const news = row?.news ?? [];
-  const upProbability = finiteNumber(modelRow?.p_up) ?? stock.upProbability ?? null;
-  const legacyPredictedReturn =
-    finiteNumber(modelRow?.lstm_pred_return) ??
-    (modelRow?.p_up === undefined ? finiteNumber(modelRow?.ensemble_pred_return) : null) ??
-    stock.predictedReturn;
-  const kospi = findKospiIndex(detail.dashboard.indices);
-  const analyzedStock: StockQuote = {
-    ...stock,
-    aiSummary: result?.summary || stock.aiSummary,
-    confidence: result?.confidence ?? stock.confidence,
-    predictedReturn: legacyPredictedReturn,
-    sentimentLabel: result?.label ?? stock.sentimentLabel,
-    upProbability,
-  };
-  const gate = evaluateRiskGate(analyzedStock, kospi);
-  // The freshly-fetched candidate row is the authoritative AI source for this
-  // report — prefer it over the dashboard snapshot quote, whose AI fields are
-  // only populated once a snapshot refresh has merged the pipeline output. This
-  // makes the Gemini news/sentiment view appear right after an analysis run,
-  // independent of snapshot timing.
-  const hasResultSentiment = (result?.confidence ?? 0) > 0;
-  const llmReady = hasResultSentiment || hasLlmSentiment(analyzedStock);
-  const verdictLabel = result?.label ?? analyzedStock.sentimentLabel;
-  const verdictConfidence = hasResultSentiment && result ? result.confidence : analyzedStock.confidence;
-  const verdictSummary = result?.summary || describeAiSummary(analyzedStock);
-  const isWatched = watchCodes.includes(stock.code);
-
-  async function analyzeSelectedStockNews() {
-    setNewsAnalysisState({ error: "", isRunning: true, message: "뉴스와 Gemini 분석을 실행 중입니다." });
-    try {
-      await runStockNewsAnalysis(stock!.code);
-      setNewsAnalysisState({ error: "", isRunning: false, message: "뉴스 분석이 완료되었습니다." });
-      reload();
-    } catch (cause) {
-      setNewsAnalysisState({
-        error: cause instanceof Error ? cause.message : "뉴스 분석에 실패했습니다.",
-        isRunning: false,
-        message: "",
-      });
-    }
-  }
-
-  function toggleWatch() {
-    setWatchCodes((current) =>
-      current.includes(stock!.code)
-        ? current.filter((item) => item !== stock!.code)
-        : [stock!.code, ...current],
-    );
-  }
-
   return (
     <main className="stock-detail-page">
       <div className="detail-back-row">
         <Link className="detail-back-link" to="/dashboard">
           ← 실시간 대시보드
         </Link>
-        {isRefreshing ? <span className="detail-refresh-flag">최신 데이터 동기화 중…</span> : null}
+        <span className="detail-source-flag">
+          {isSyncing ? "최신 분석 동기화 중…" : isLive ? "실시간 파이프라인 결과" : "최근 생성된 분석 결과"}
+        </span>
       </div>
 
       <header className="detail-hero">
         <div className="detail-hero__id">
-          <span className="detail-hero__eyebrow">종목 분석 리포트</span>
+          <span className="detail-hero__eyebrow">AI 추천 종목 리포트</span>
           <h1>
-            {stock.name} <small>{stock.code}</small>
+            {displayName} <small>{normalized}</small>
           </h1>
-          <p className="detail-hero__market">
-            {stock.isKospi200 ? `${stock.market} · KOSPI200` : stock.market}
-          </p>
+          <p className="detail-hero__market">{stock?.isKospi200 ? "KOSPI · KOSPI200" : "KOSPI"}</p>
         </div>
-        <div className="detail-hero__price">
-          <strong>{formatWon(stock.currentPrice)}</strong>
-          <span className={changeTone(stock.change)}>
-            {formatWon(stock.change)} ({formatRate(stock.changeRate)}) · {directionLabel(stock.direction)}
-          </span>
-        </div>
-        <button
-          className={`report-button ${isWatched ? "is-active" : ""}`}
-          onClick={toggleWatch}
-          type="button"
-        >
+        {stock ? (
+          <div className="detail-hero__price">
+            <strong>{formatWon(stock.currentPrice)}</strong>
+            <span className={changeTone(stock.change)}>
+              {formatWon(stock.change)} ({formatRate(stock.changeRate)}) · {directionLabel(stock.direction)}
+            </span>
+          </div>
+        ) : null}
+        <button className={`report-button ${isWatched ? "is-active" : ""}`} onClick={toggleWatch} type="button">
           {isWatched ? "관심 해제" : "관심 추가"}
         </button>
       </header>
 
-      {error ? (
-        <p className="detail-banner detail-banner--warn">
-          실시간 데이터를 불러오지 못해 최근 기준 데이터를 표시합니다.
-        </p>
+      {candidate ? (
+        <AiRecommendation candidate={candidate} />
+      ) : (
+        <section className="detail-card">
+          <p className="factor-empty">이 종목의 AI 분석 결과가 아직 없습니다.</p>
+        </section>
+      )}
+
+      {stock ? (
+        <section className="detail-card reco-reveal" style={{ animationDelay: "440ms" }}>
+          <h2>가격 차트</h2>
+          <StockChartPanel stock={stock} />
+        </section>
       ) : null}
-
-      <section className="detail-card detail-verdict">
-        <h2>AI 투자 의견</h2>
-        <div className="verdict-grid">
-          <div className={`verdict-headline verdict-headline--${verdictLabel.toLowerCase()}`}>
-            <span>{llmReady ? "뉴스 감성" : "예측 방향"}</span>
-            <strong>{sentimentKo(verdictLabel)}</strong>
-          </div>
-          <div className="detail-stats verdict-stats">
-            <StatRow
-              label={upProbability !== null ? "상승 확률(익일)" : "예상 수익률(익일)"}
-              value={
-                upProbability !== null
-                  ? `${(upProbability * 100).toFixed(2)}%`
-                  : legacyPredictedReturn === null
-                    ? "—"
-                    : formatRate(legacyPredictedReturn)
-              }
-              tone={
-                upProbability !== null
-                  ? changeTone(upProbability - 0.5)
-                  : legacyPredictedReturn === null
-                    ? undefined
-                    : changeTone(legacyPredictedReturn)
-              }
-            />
-            <StatRow label="신뢰도" value={llmReady ? `${Math.round(verdictConfidence * 100)}%` : "—"} />
-            {result ? (
-              <StatRow
-                label="감성 점수"
-                value={llmReady ? result.sentiment_score.toFixed(2) : "—"}
-                tone={llmReady ? changeTone(result.sentiment_score) : undefined}
-              />
-            ) : null}
-          </div>
-        </div>
-        <p className="reason-text">{verdictSummary}</p>
-        {/* `caution` carries the internal fallback reason (e.g. the missing API
-            key) for fallback rows — only surface it for genuine LLM analyses,
-            where it's a real analytical caveat rather than a diagnostic string. */}
-        {llmReady && result?.caution ? <p className="detail-caution">⚠ {result.caution}</p> : null}
-      </section>
-
-      <section className="detail-card">
-        <h2>예측 모델 근거 (Transformer)</h2>
-        {modelRow ? (
-          <div className="detail-stats">
-            <StatRow
-              label="익일 상승 확률"
-              value={upProbability === null ? "—" : `${(upProbability * 100).toFixed(2)}%`}
-              tone={upProbability === null ? undefined : changeTone(upProbability - 0.5)}
-            />
-            <StatRow
-              label="전체 예측 순위"
-              value={
-                finiteNumber(modelRow.pred_rank) === null
-                  ? "—"
-                  : `${finiteNumber(modelRow.pred_rank)}위 / ${finiteNumber(modelRow.pred_pool_size) ?? "—"}개`
-              }
-            />
-            <StatRow
-              label="예측 기준일"
-              value={String(modelRow.transformer_base_date ?? modelRow.lstm_base_date ?? "—")}
-            />
-            <StatRow
-              label="모델 상태"
-              value={String(modelRow.prediction_status ?? modelRow.lstm_status ?? "—")}
-            />
-            <StatRow label="시계열 데이터" value={String(modelRow.ohlcv_source ?? "—")} />
-          </div>
-        ) : (
-          <p className="factor-empty">
-            이 종목의 Transformer 예측 결과가 없습니다. OHLCV 데이터 부족 또는 예측 실패 상태를 확인해야 합니다.
-          </p>
-        )}
-        <p className="panel-note">
-          OHLCV 기술지표 시퀀스를 학습한 Transformer 분류 모델이 다음 거래일 상승 확률을 계산합니다. 확률은 투자
-          판단의 참고 지표이며, 수익률이나 수익을 보장하지 않습니다.
-        </p>
-      </section>
-
-      <section className="detail-card">
-        <div className="detail-card-heading">
-          <h2>뉴스·감성 근거 (Gemini)</h2>
-          <button
-            className="secondary-button"
-            disabled={newsAnalysisState.isRunning || !modelRow}
-            onClick={analyzeSelectedStockNews}
-            type="button"
-          >
-            {newsAnalysisState.isRunning ? "분석 중" : llmReady ? "뉴스 다시 분석" : "이 종목 뉴스 분석"}
-          </button>
-        </div>
-        {newsAnalysisState.message ? <p className="detail-analysis-status">{newsAnalysisState.message}</p> : null}
-        {newsAnalysisState.error ? (
-          <p className="detail-analysis-status detail-analysis-status--error">{newsAnalysisState.error}</p>
-        ) : null}
-        {llmReady && result ? (
-          <>
-            <div className="factor-columns">
-              <div>
-                <h3 className="factor-heading is-positive-text">긍정 요인</h3>
-                <FactorList items={result.positive_factors} tone="positive" />
-              </div>
-              <div>
-                <h3 className="factor-heading is-negative-text">부정 요인</h3>
-                <FactorList items={result.negative_factors} tone="negative" />
-              </div>
-              <div>
-                <h3 className="factor-heading">핵심 데이터</h3>
-                <FactorList items={result.key_data_points} tone="neutral" />
-              </div>
-            </div>
-            {result.trading_insight ? (
-              <p className="trading-insight">
-                <strong>투자 인사이트</strong> {result.trading_insight}
-              </p>
-            ) : null}
-          </>
-        ) : (
-          <p className="factor-empty">
-            이 종목의 Gemini 분석 결과가 아직 없습니다. 위 버튼을 누르면 현재 종목만 네이버 뉴스와 기술지표를
-            결합해 분석합니다.
-          </p>
-        )}
-
-        <h3 className="factor-heading factor-heading--news">분석에 사용한 뉴스</h3>
-        {news.length > 0 ? (
-          <ul className="news-list">
-            {news.map((item) => (
-              <li key={item.index}>
-                {item.url ? (
-                  <a href={item.url} target="_blank" rel="noopener noreferrer">
-                    {item.title}
-                  </a>
-                ) : (
-                  <span>{item.title}</span>
-                )}
-                <small>
-                  {item.source} · {item.pub_date}
-                </small>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="factor-empty">분석에 사용된 뉴스 항목이 없습니다.</p>
-        )}
-      </section>
-
-      <section className="detail-card">
-        <h2>가격 차트</h2>
-        <StockChartPanel stock={stock} />
-      </section>
-
-      <section className="detail-card">
-        <h2>투자자 수급</h2>
-        <FlowBars flow={stock.investorFlow} />
-        <div className="detail-stats">
-          <StatRow label="거래량" value={`${stock.accumulatedVolume.toLocaleString("ko-KR")}주`} />
-          <StatRow label="거래대금" value={formatCompactWon(stock.tradingValue)} />
-          <StatRow label="거래대금 순위" value={stock.tradingValueRank > 0 ? `${stock.tradingValueRank}위` : "—"} />
-        </div>
-      </section>
-
-      <section className={`detail-card risk-gate ${gate.blocked ? "risk-gate--blocked" : "risk-gate--clear"}`}>
-        <h2>자동매매 리스크 게이트</h2>
-        <p className="risk-gate__verdict">
-          {gate.blocked
-            ? "⛔ 신규 진입 제한 — 아래 위험 조건 중 2개 이상이 충족되었습니다."
-            : "✅ 신규 진입 허용 — 위험 조건이 2개 미만입니다."}
-        </p>
-        <ul className="risk-condition-list">
-          {gate.conditions.map((condition) => (
-            <li key={condition.label} className={condition.triggered ? "is-triggered" : "is-clear"}>
-              <span className="risk-condition__mark">{condition.triggered ? "위험" : "정상"}</span>
-              <span className="risk-condition__label">{condition.label}</span>
-              <small>{condition.detail}</small>
-            </li>
-          ))}
-        </ul>
-        <p className="panel-note">
-          지수 -3% 이하, 외국인 순매도, 신뢰도 70% 미만 중 2개 이상이면 신규 진입을 제한하는 규칙을 이 종목에
-          실시간으로 적용한 결과입니다.
-        </p>
-      </section>
 
       <footer className="detail-sources">
         <h2>데이터 출처 및 유의사항</h2>
         <ul>
-          <li>시세·거래대금·투자자 수급: 한국투자증권(KIS) Open API.</li>
-          <li>
-            익일 상승 확률: 자체 학습 Transformer 모델 (예측 기준일 {String(modelRow?.transformer_base_date ?? "—")}).
-          </li>
-          <li>뉴스·감성: 네이버 뉴스 + Gemini 구조화 분석 (키 미설정 시 모델 예측 방향만 반영).</li>
-          <li>기준 시각: {detail.dashboard.generatedAt} · {detail.dashboard.sessionLabel}</li>
+          <li>익일 상승 확률·예측 순위: 자체 학습 Transformer 모델{candidate?.baseDate ? ` (기준일 ${candidate.baseDate})` : ""}.</li>
+          <li>수급(외국인·기관 순매수): 최근 거래일 누적 순매수 금액.</li>
+          <li>뉴스·감성 점수: 네이버 뉴스 + Gemini 구조화 분석(integrated_pipeline.py · step3).</li>
         </ul>
         <p className="panel-note">
-          모의투자(VTS) 환경 시세는 실제 시장가와 다를 수 있습니다. 본 리포트는 투자 참고용이며 투자 손익에 대한
+          현재 시세는 KIS 연동 전 데모용 기준 데이터일 수 있습니다. 본 리포트는 투자 참고용이며 투자 손익에 대한
           책임은 투자자 본인에게 있습니다.
         </p>
       </footer>

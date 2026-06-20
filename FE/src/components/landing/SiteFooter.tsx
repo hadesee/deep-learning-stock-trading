@@ -23,7 +23,7 @@ export function SiteFooter() {
             <ul>
               {dashboardLinks.map((link) => (
                 <li key={link.label}>
-                  <Link to={link.to}>{link.label}</Link>
+                  <Link state={{ resetAnalysis: true }} to={link.to}>{link.label}</Link>
                 </li>
               ))}
             </ul>

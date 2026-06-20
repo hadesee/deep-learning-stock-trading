@@ -12,7 +12,7 @@ const JSON_RESULT_FILES = ["final_stock_transformer_news_llm_result.json"];
 const LEGACY_JSON_RESULT_FILES = ["final_stock_lstm_news_llm_result.json"];
 const CSV_RESULT_FILES = ["step2_final_top10.csv"];
 const FULL_RANK_CSV_RESULT_FILES = ["step2_all_transformer_rank.csv"];
-const NEWS_RESULT_FILES = ["news_gemini_result.json"];
+const NEWS_RESULT_FILES = ["news_gemini_result.json", "step3_final_news_llm_analysis.json"];
 
 type GeminiEvaluation = {
   sentiment?: unknown;
@@ -21,6 +21,8 @@ type GeminiEvaluation = {
   final_combined_score?: unknown;
   news_overall_score?: unknown;
   news_sentiment_tally?: unknown;
+  news_item_sentiments?: unknown;
+  news_sentiments?: unknown;
   summary?: unknown;
   trading_insight?: unknown;
 };
@@ -296,21 +298,146 @@ function sentimentLabelFromGemini(sentiment: string): { label: string; label_ko:
   return { label: "NEUTRAL", label_ko: "중립" };
 }
 
-function toPipelineNews(value: unknown): PipelineOutputRow["news"] {
+function tickerFromRow(row: PipelineOutputRow): string {
+  return String(row.result?.ticker ?? row.input_row?.ticker ?? "").padStart(6, "0");
+}
+
+function finalSentimentFromEntry(entry: GeminiNewsEntry | undefined): string {
+  const evaluation = entry?.evaluation ?? {};
+  const explicitSentiment = stringValue(evaluation.final_sentiment) || stringValue(evaluation.sentiment);
+  if (explicitSentiment) {
+    return explicitSentiment;
+  }
+
+  const combinedScore = toFiniteOrNull(evaluation.final_combined_score);
+  if (combinedScore === null) {
+    return "";
+  }
+
+  if (combinedScore >= 70) {
+    return "Bullish";
+  }
+  if (combinedScore >= 60) {
+    return "Neutral";
+  }
+  return "Bearish";
+}
+
+function finalCombinedScoreFromEntry(entry: GeminiNewsEntry | undefined): number | null {
+  return toFiniteOrNull(entry?.evaluation?.final_combined_score) ?? toFiniteOrNull(entry?.evaluation?.impact_score);
+}
+
+function isDisplayableLlmEntry(entry: GeminiNewsEntry | undefined): boolean {
+  const sentiment = finalSentimentFromEntry(entry);
+  if (sentiment === "") {
+    return false;
+  }
+
+  const { label } = sentimentLabelFromGemini(sentiment);
+  return label === "POSITIVE" || label === "NEUTRAL";
+}
+
+function sortRowsByLlmScoreThenRank(
+  rows: PipelineOutputRow[],
+  news: Map<string, GeminiNewsEntry>,
+): PipelineOutputRow[] {
+  return [...rows].sort((a, b) => {
+    const aScore = finalCombinedScoreFromEntry(news.get(tickerFromRow(a))) ?? -1;
+    const bScore = finalCombinedScoreFromEntry(news.get(tickerFromRow(b))) ?? -1;
+    if (bScore !== aScore) {
+      return bScore - aScore;
+    }
+
+    const aRank = toFiniteOrNull(a.input_row?.pred_rank) ?? Number.MAX_SAFE_INTEGER;
+    const bRank = toFiniteOrNull(b.input_row?.pred_rank) ?? Number.MAX_SAFE_INTEGER;
+    return aRank - bRank;
+  });
+}
+
+type NewsSentimentMeta = {
+  label: string;
+  label_ko: string;
+  reason?: string;
+};
+
+function newsSentimentMapFromEvaluation(evaluation: GeminiEvaluation): Map<number, NewsSentimentMeta> {
+  const raw = evaluation.news_item_sentiments ?? evaluation.news_sentiments;
+  const map = new Map<number, NewsSentimentMeta>();
+
+  const add = (indexValue: unknown, sentimentValue: unknown, reasonValue?: unknown) => {
+    const index = toFiniteOrNull(indexValue);
+    const sentiment = stringValue(sentimentValue);
+    if (index === null || index < 1 || sentiment === "") {
+      return;
+    }
+
+    const { label, label_ko } = sentimentLabelFromGemini(sentiment);
+    const reason = stringValue(reasonValue);
+    map.set(Math.round(index), {
+      label,
+      label_ko,
+      ...(reason ? { reason } : {}),
+    });
+  };
+
+  if (Array.isArray(raw)) {
+    raw.forEach((item, itemIndex) => {
+      if (item && typeof item === "object") {
+        const object = item as Record<string, unknown>;
+        add(
+          object.index ?? object.news_index ?? object.no ?? itemIndex + 1,
+          object.sentiment ?? object.label ?? object.direction,
+          object.reason ?? object.summary ?? object.rationale,
+        );
+      } else {
+        add(itemIndex + 1, item);
+      }
+    });
+  } else if (raw && typeof raw === "object") {
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (value && typeof value === "object") {
+        const object = value as Record<string, unknown>;
+        add(
+          object.index ?? key,
+          object.sentiment ?? object.label ?? object.direction,
+          object.reason ?? object.summary ?? object.rationale,
+        );
+      } else {
+        add(key, value);
+      }
+    }
+  }
+
+  return map;
+}
+
+function toPipelineNews(value: unknown, evaluation: GeminiEvaluation = {}): PipelineOutputRow["news"] {
   if (!Array.isArray(value)) {
     return [];
   }
+
+  const sentimentByIndex = newsSentimentMapFromEvaluation(evaluation);
 
   return value
     .map((raw, index) => {
       const item = (raw ?? {}) as Record<string, unknown>;
       const url = stringValue(item.url);
+      const newsIndex = toFiniteOrNull(item.index) ?? index + 1;
+      const sentiment = sentimentByIndex.get(newsIndex) ?? sentimentByIndex.get(index + 1);
       return {
-        index: toFiniteOrNull(item.index) ?? index + 1,
+        index: newsIndex,
         pub_date: stringValue(item.pub_date),
         source: stringValue(item.source),
         title: stringValue(item.title),
+        description: stringValue(item.description) || undefined,
         url: url || undefined,
+        ...(sentiment
+          ? {
+              sentiment: sentiment.label,
+              sentiment_ko: sentiment.label_ko,
+              sentiment_reason: sentiment.reason,
+            }
+          : {}),
       };
     })
     .filter((item) => item.title !== "");
@@ -333,7 +460,7 @@ function applyNewsToRow(row: PipelineOutputRow, entry: GeminiNewsEntry): Pipelin
   const sentiment = stringValue(evaluation.final_sentiment) || stringValue(evaluation.sentiment);
   const sentimentTally = stringValue(evaluation.news_sentiment_tally);
   const tradingInsight = stringValue(evaluation.trading_insight);
-  const news = toPipelineNews(entry.news);
+  const news = toPipelineNews(entry.news, evaluation);
 
   const hasEvaluation =
     sentiment !== "" || summary !== "" || impact !== null || combinedScore !== null || newsScore !== null;
@@ -480,7 +607,20 @@ export async function loadPipelineRows(): Promise<PipelineOutputRow[] | null> {
  * otherwise an empty array. The frontend decides whether to fall back to mock.
  */
 export async function getCandidatesPayload(): Promise<PipelineOutputRow[]> {
-  return (await loadPipelineRows()) ?? [];
+  const rows = await loadPipelineRows();
+  if (!rows) {
+    return [];
+  }
+
+  const news = await loadNewsResult();
+  if (!news) {
+    return rows;
+  }
+
+  return sortRowsByLlmScoreThenRank(
+    rows.filter((row) => isDisplayableLlmEntry(news.get(tickerFromRow(row)))),
+    news,
+  );
 }
 
 /**
@@ -493,8 +633,16 @@ export async function getStockAnalysisPayload(ticker: string): Promise<PipelineO
     throw new Error("A valid 6-digit ticker is required.");
   }
 
+  const top10Rows = await loadPipelineRows();
+  const top10Match = top10Rows?.find(
+    (row) => String(row.input_row?.ticker ?? row.result?.ticker ?? "").padStart(6, "0") === normalized,
+  );
+  if (top10Match) {
+    return top10Match;
+  }
+
   const fullRank = await loadCsvRows(FULL_RANK_CSV_RESULT_FILES, false);
-  const rows = fullRank ? await overlayNewsResult(fullRank.rows) : await loadPipelineRows();
+  const rows = fullRank ? await overlayNewsResult(fullRank.rows) : top10Rows;
   return rows?.find((row) => String(row.input_row?.ticker ?? row.result?.ticker ?? "").padStart(6, "0") === normalized) ?? null;
 }
 

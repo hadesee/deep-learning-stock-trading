@@ -57,7 +57,8 @@ DEFAULT_PREDICT_MODULE    = BASE_DIR / "predict.py"
 DEFAULT_OUTPUT_DIR        = BASE_DIR / "outputs"
 MIN_OHLCV_ROWS            = 60
 SUPPLY_REQUEST_SLEEP_SECONDS = float(os.getenv("KIS_SUPPLY_SLEEP_SECONDS", "0.3"))
-SUPPLY_MAX_RETRIES = max(1, int(os.getenv("KIS_SUPPLY_MAX_RETRIES", "5")))
+SUPPLY_REQUEST_TIMEOUT_SECONDS = float(os.getenv("KIS_SUPPLY_TIMEOUT_SECONDS", "5"))
+SUPPLY_MAX_RETRIES = max(1, int(os.getenv("KIS_SUPPLY_MAX_RETRIES", "2")))
 KST = timezone(timedelta(hours=9))
 
 # config.py(같은 폴더)에서 KIS 토큰매니저/베이스URL 임포트 보장 (main.py 와 동일 패턴)
@@ -277,7 +278,12 @@ def _fetch_supply_trend(
     reason = ""
     for attempt in range(1, SUPPLY_MAX_RETRIES + 1):
         try:
-            resp = token_manager.session.get(url, headers=headers, params=params, timeout=10)
+            resp = token_manager.session.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=SUPPLY_REQUEST_TIMEOUT_SECONDS,
+            )
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
         else:
@@ -528,8 +534,10 @@ def step2_attach_transformer(
 
     if token_manager is not None:
         print(f"  Transformer Top{len(supply_target_indices)} 수급 조회:")
-        for idx in supply_target_indices:
+        total_supply_targets = len(supply_target_indices)
+        for supply_position, idx in enumerate(supply_target_indices, start=1):
             ticker = str(supply_df.at[idx, "ticker"]).zfill(6)
+            print(f"    [수급 조회] {supply_position}/{total_supply_targets} {ticker}")
             try:
                 trend = _fetch_supply_trend(
                     ticker,
@@ -668,14 +676,17 @@ def run_news_crawling_and_llm(
         # CSV 형태로도 저장
         results_list = []
         for ticker, data in analyzed_results.items():
+            evaluation = data.get("evaluation", {})
+            final_sentiment = evaluation.get("final_sentiment") or evaluation.get("sentiment", "")
+            final_score = evaluation.get("final_combined_score", evaluation.get("impact_score", 0))
             record = {
                 "ticker": ticker,
                 "company_name": data.get("company_name", ""),
                 "news_count": data.get("news_count", 0),
-                "sentiment": data.get("evaluation", {}).get("sentiment", ""),
-                "impact_score": data.get("evaluation", {}).get("impact_score", 0),
-                "summary": data.get("evaluation", {}).get("summary", ""),
-                "trading_insight": data.get("evaluation", {}).get("trading_insight", ""),
+                "sentiment": final_sentiment,
+                "impact_score": final_score,
+                "summary": evaluation.get("summary", ""),
+                "trading_insight": evaluation.get("trading_insight", ""),
             }
             results_list.append(record)
         
@@ -688,7 +699,7 @@ def run_news_crawling_and_llm(
             print(f"\n  📊 분석 결과 요약:")
             for _, row in results_df.iterrows():
                 print(f"    [{row['sentiment']}] {row['ticker']} {row['company_name']}: "
-                      f"영향도={row['impact_score']}, "
+                      f"종합점수={row['impact_score']}, "
                       f"뉴스={row['news_count']}건")
     
     except Exception as e:

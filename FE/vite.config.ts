@@ -151,9 +151,11 @@ export default defineConfig(({ mode }) => {
       // Bind to all interfaces so the dev server is reachable over the LAN and
       // through a tunnel (Cloudflare Tunnel / ngrok), not just on localhost.
       host: true,
-      // Honor a PORT env var (e.g. assigned by the preview harness) when present,
-      // otherwise fall back to Vite's default (5173).
-      port: process.env.PORT ? Number(process.env.PORT) : undefined,
+      // Keep local development on one canonical port. If another dev server is
+      // already using it, fail fast instead of silently opening 5174/5175 and
+      // splitting API state across multiple Vite processes.
+      port: process.env.PORT ? Number(process.env.PORT) : 5173,
+      strictPort: true,
       // Dev only: accept any Host header so dynamic tunnel domains
       // (*.trycloudflare.com, *.ngrok-free.app) aren't rejected by Vite's
       // host check. Does not affect production builds.

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, mkdir, readFile } from "node:fs/promises";
+import { access, mkdir, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { getCandidatesPayload, refreshDashboardAiFieldsFromPipelineOutput } from "./pipelineResults";
 
@@ -11,8 +11,6 @@ declare const process: {
 export type CandidateAnalysisRunResult = {
   dashboardUpdated: boolean;
   elapsedMs: number;
-  outputCsvPath?: string;
-  outputJsonPath: string;
   rows: number;
   /** Number of stocks the Gemini news step analyzed; 0 when the step was skipped or failed. */
   newsRows: number;
@@ -22,7 +20,142 @@ export type CandidateAnalysisRunResult = {
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_LOG_CHARS = 6000;
 
+export type CandidateAnalysisProgress = {
+  stage: string;
+  stageCount: number;
+  stageIndex: number;
+  progressPercent: number;
+  message: string;
+  updatedAt: number;
+};
+
+const CANDIDATE_PROGRESS_STAGES = [
+  "실행 준비",
+  "KOSPI200 후보 풀 로드",
+  "OHLCV 수집·Transformer 예측",
+  "외국인·기관 수급 조회",
+  "뉴스 크롤링",
+  "Gemini LLM 종합 판단",
+  "결과 파일 검증",
+] as const;
+
 let activeRun: Promise<CandidateAnalysisRunResult> | null = null;
+
+function boundedPercent(value: number): number {
+  return Math.min(100, Math.max(0, Math.round(value)));
+}
+
+function cleanLogLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, 240);
+}
+
+function publicCandidateAnalysisError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/timed out|timeout|시간이 초과/i.test(message)) {
+    return "AI 후보 분석 시간이 초과되었습니다. 잠시 후 다시 실행하거나 서버 콘솔에서 병목 단계를 확인하세요.";
+  }
+  if (/not found|없음|not updated|찾지 못|결과 파일/i.test(message)) {
+    return "분석 결과 파일을 확인하지 못했습니다. 서버 콘솔에서 파이프라인 실행 상태를 확인하세요.";
+  }
+  return "AI 후보 분석 중 오류가 발생했습니다. 서버 콘솔에서 상세 로그를 확인하세요.";
+}
+
+function progressSnapshot(
+  stageIndex: number,
+  progressPercent: number,
+  message?: string,
+  previous?: CandidateAnalysisProgress,
+): CandidateAnalysisProgress {
+  const safeStageIndex = Math.min(Math.max(stageIndex, 0), CANDIDATE_PROGRESS_STAGES.length - 1);
+  return {
+    message: message ?? CANDIDATE_PROGRESS_STAGES[safeStageIndex],
+    progressPercent: boundedPercent(progressPercent),
+    stage: CANDIDATE_PROGRESS_STAGES[safeStageIndex],
+    stageCount: CANDIDATE_PROGRESS_STAGES.length,
+    stageIndex: safeStageIndex,
+    updatedAt: Date.now(),
+  };
+}
+
+function initialProgress(): CandidateAnalysisProgress {
+  return progressSnapshot(0, 3, "분석 작업을 준비하는 중입니다.");
+}
+
+function nextProgressFromLog(line: string, current: CandidateAnalysisProgress): CandidateAnalysisProgress {
+  const log = cleanLogLine(line);
+  let stageIndex = current.stageIndex;
+  let progressPercent = current.progressPercent;
+  let message = current.message;
+
+  const advance = (nextStage: number, nextPercent: number, nextMessage: string) => {
+    stageIndex = Math.max(stageIndex, nextStage);
+    progressPercent = Math.max(progressPercent, nextPercent);
+    message = nextMessage;
+  };
+
+  if (log.includes("[STEP 1]")) {
+    advance(1, 12, "KOSPI200 후보 풀을 불러오는 중입니다.");
+  } else if (log.includes("로드 완료")) {
+    advance(1, 20, "KOSPI200 후보 풀 로드가 완료되었습니다.");
+  } else if (log.includes("[STEP 2]")) {
+    advance(2, 26, "OHLCV를 수집하고 Transformer 상승 확률을 계산하는 중입니다.");
+  } else if (log.includes("P(up) 예측 성공")) {
+    const countMatch = log.match(/P\(up\) 예측 성공:\s*([0-9]+)\/([0-9]+)개/);
+    advance(
+      2,
+      50,
+      countMatch
+        ? `Transformer 예측 완료: ${countMatch[1]}/${countMatch[2]}개 종목`
+        : "Transformer 예측이 완료되었습니다.",
+    );
+  } else if (log.includes("수급 조회")) {
+    const supplyMatch = log.match(/수급 조회\]\s*([0-9]+)\/([0-9]+)/);
+    if (supplyMatch) {
+      const current = Number(supplyMatch[1]);
+      const total = Math.max(1, Number(supplyMatch[2]));
+      const supplyProgress = 60 + Math.min(8, Math.round((current / total) * 8));
+      advance(3, supplyProgress, `상위 후보의 외국인·기관 수급을 확인하는 중입니다. (${current}/${total})`);
+    } else {
+      advance(3, 60, "상위 후보의 외국인·기관 수급을 확인하는 중입니다.");
+    }
+  } else if (log.includes("Transformer 최종")) {
+    advance(3, 68, "수급 확인을 반영해 최종 후보를 구성하는 중입니다.");
+  } else if (log.includes("[STEP 3]")) {
+    advance(4, 72, "STEP2 Top10을 기반으로 뉴스·LLM 분석을 시작합니다.");
+  } else if (log.includes("뉴스 크롤링")) {
+    advance(4, 78, "최신 뉴스를 수집하는 중입니다.");
+  } else if (log.includes("Gemini") || log.includes("LLM") || log.includes("API 호출")) {
+    advance(5, 84, "Gemini가 모델·수급·뉴스 근거를 종합 판단하는 중입니다.");
+  } else if (log.includes("[최종 결과]")) {
+    advance(5, 90, "종목별 LLM 판단 결과를 정리하는 중입니다.");
+  } else if (log.includes("저장:") && log.includes("step3")) {
+    advance(6, 94, "STEP3 결과 파일을 저장하고 검증하는 중입니다.");
+  } else if (log.includes("[ALL DONE]")) {
+    advance(6, 100, "전체 파이프라인이 완료되었습니다.");
+  }
+
+  return {
+    ...progressSnapshot(stageIndex, progressPercent, message, current),
+  };
+}
+
+function updateCandidateAnalysisProgress(
+  updater: CandidateAnalysisProgress | ((current: CandidateAnalysisProgress) => CandidateAnalysisProgress),
+): void {
+  if (runState.status !== "running") {
+    return;
+  }
+
+  const next = typeof updater === "function" ? updater(runState.progress) : updater;
+  runState = { ...runState, progress: next };
+}
+
+function recordCandidateAnalysisOutput(text: string): void {
+  const lines = text.split(/\r?\n/).map(cleanLogLine).filter(Boolean);
+  for (const line of lines) {
+    updateCandidateAnalysisProgress((current) => nextProgressFromLog(line, current));
+  }
+}
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -69,13 +202,18 @@ function optionalNumericArg(args: string[], name: string, value: string | undefi
   }
 }
 
-function truthyEnv(value: string | undefined): boolean {
-  return ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
-}
-
 async function requireExistingFile(path: string, label: string): Promise<void> {
   if (!(await pathExists(path))) {
     throw new Error(`${label} not found: ${path}`);
+  }
+}
+
+async function requireFreshFile(path: string, label: string, startedAt: number): Promise<void> {
+  await requireExistingFile(path, label);
+
+  const file = await stat(path);
+  if (file.mtimeMs + 1000 < startedAt) {
+    throw new Error(`${label} was not updated by the latest pipeline run: ${path}`);
   }
 }
 
@@ -113,6 +251,9 @@ function pipelineEnv(env: Record<string, string | undefined>): Record<string, st
     ...env,
     PYTHONIOENCODING: env.PYTHONIOENCODING ?? "utf-8",
     PYTHONUTF8: env.PYTHONUTF8 ?? "1",
+    // Unbuffered stdout/stderr so per-stock progress streams live to the dev
+    // console instead of arriving in one big buffered chunk at the end.
+    PYTHONUNBUFFERED: env.PYTHONUNBUFFERED ?? "1",
   };
   const appKey = env.KIS_MOCK_APP_KEY ?? env.KIS_APP_KEY ?? env.APP_KEY ?? env.KIS_REAL_APP_KEY;
   const appSecret = env.KIS_MOCK_APP_SECRET ?? env.KIS_APP_SECRET ?? env.APP_SECRET ?? env.KIS_REAL_APP_SECRET;
@@ -144,6 +285,7 @@ function runProcess(
   cwd: string,
   env: Record<string, string | undefined>,
   timeoutMs: number,
+  onOutput?: (text: string) => void,
 ): Promise<void> {
   return new Promise((resolveRun, rejectRun) => {
     const child = spawn(command, args, {
@@ -164,10 +306,23 @@ function runProcess(
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {
-      stdout = tail(stdout + chunk.toString());
+      const text = chunk.toString();
+      stdout = tail(stdout + text);
+      onOutput?.(text);
+      // Stream progress to the dev console so a long run isn't a silent black box.
+      const trimmed = text.replace(/\s+$/, "");
+      if (trimmed) {
+        console.log(`[pipeline] ${trimmed}`);
+      }
     });
     child.stderr.on("data", (chunk) => {
-      stderr = tail(stderr + chunk.toString());
+      const text = chunk.toString();
+      stderr = tail(stderr + text);
+      onOutput?.(text);
+      const trimmed = text.replace(/\s+$/, "");
+      if (trimmed) {
+        console.error(`[pipeline] ${trimmed}`);
+      }
     });
 
     child.on("error", (error) => {
@@ -197,62 +352,10 @@ function runProcess(
   });
 }
 
-/** File the Gemini news step writes and {@link pipelineResults} overlays. */
+/** File the on-demand per-stock Gemini news step writes and {@link pipelineResults} overlays. */
 const NEWS_RESULT_FILE = "news_gemini_result.json";
 
-/**
- * Whether to run the Gemini news step. Defaults to on so the combined analysis
- * surfaces news sentiment; set `PIPELINE_RUN_NEWS=false` to skip (e.g. no Gemini
- * key, or to save API cost). Credentials live in the project-root `.env` that
- * crolling.py loads itself, so we don't gate on Node seeing the keys.
- */
-function shouldRunNews(env: Record<string, string | undefined>): boolean {
-  const explicit = (env.PIPELINE_RUN_NEWS ?? "").trim();
-  if (explicit !== "") {
-    return truthyEnv(explicit);
-  }
-  return true;
-}
-
-/**
- * Spawns crolling.py with the Transformer Top-N CSV as input, writing
- * `outputs/news_gemini_result.json`. Returns the analyzed-stock count, or 0 when
- * skipped/failed (best-effort — never throws).
- */
-async function runNewsStep(
-  python: string,
-  root: string,
-  outputDir: string,
-  inputCsvPath: string,
-  env: Record<string, string | undefined>,
-  timeoutMs: number,
-): Promise<number> {
-  if (!shouldRunNews(env)) {
-    return 0;
-  }
-
-  const newsScript = resolve(env.PIPELINE_NEWS_SCRIPT ?? join(root, "crolling.py"));
-  if (!(await pathExists(newsScript))) {
-    return 0;
-  }
-
-  const newsOutputPath = join(outputDir, NEWS_RESULT_FILE);
-  const args = [newsScript, "--input", inputCsvPath, "--output", newsOutputPath];
-  optionalNumericArg(args, "--days", env.PIPELINE_RUN_NEWS_DAYS);
-  optionalNumericArg(args, "--max-news", env.PIPELINE_RUN_MAX_NEWS);
-
-  try {
-    await runProcess(python, args, root, pipelineEnv(env), timeoutMs);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[pipeline] News step (crolling.py) failed; candidates returned without news: ${message}`);
-    return 0;
-  }
-
-  return countNewsRows(newsOutputPath);
-}
-
-async function countNewsRows(newsOutputPath: string): Promise<number> {
+async function countJsonObjectRows(newsOutputPath: string): Promise<number> {
   try {
     const parsed = JSON.parse(await readFile(newsOutputPath, "utf8")) as unknown;
     return parsed && typeof parsed === "object" ? Object.keys(parsed as Record<string, unknown>).length : 0;
@@ -266,11 +369,13 @@ async function executeCandidateAnalysis(env = process.env): Promise<CandidateAna
   const root = projectRoot(env);
   const scriptPath = join(root, "integrated_pipeline.py");
   const outputDir = resolve(env.PIPELINE_OUTPUT_DIR ?? join(root, "outputs"));
-  const outputCsvPath = join(outputDir, "step2_final_top10.csv");
-  const outputJsonPath = join(outputDir, "final_stock_transformer_news_llm_result.json");
+  const top10CsvPath = join(outputDir, "step2_final_top10.csv");
+  const step3CsvPath = join(outputDir, "step3_final_news_llm_analysis.csv");
+  const step3JsonPath = join(outputDir, "step3_final_news_llm_analysis.json");
   const timeoutMs = Number(env.PIPELINE_RUN_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
   const python = await pythonExecutable(root, env);
 
+  updateCandidateAnalysisProgress(progressSnapshot(0, 5, "파이프라인 파일과 실행 환경을 확인하는 중입니다."));
   await requireExistingFile(scriptPath, "Pipeline script");
   await mkdir(outputDir, { recursive: true });
 
@@ -283,25 +388,22 @@ async function executeCandidateAnalysis(env = process.env): Promise<CandidateAna
   optionalNumericArg(args, "--supply-window", env.PIPELINE_SUPPLY_WINDOW);
   optionalNumericArg(args, "--supply-min-positive-days", env.PIPELINE_SUPPLY_MIN_POSITIVE_DAYS);
 
-  await runProcess(python, args, root, pipelineEnv(env), timeoutMs);
+  updateCandidateAnalysisProgress(progressSnapshot(0, 8, "integrated_pipeline.py 실행을 시작했습니다."));
+  await runProcess(python, args, root, pipelineEnv(env), timeoutMs, recordCandidateAnalysisOutput);
 
-  // News + Gemini sentiment is a separate best-effort step (crolling.py) that
-  // overlays onto the Transformer candidates. A failure here (missing key, news
-  // outage) must not discard the candidate output, so it's caught and logged.
-  const newsRows = await runNewsStep(python, root, outputDir, outputCsvPath, env, timeoutMs);
+  updateCandidateAnalysisProgress((current) => progressSnapshot(6, 95, "생성된 step2·step3 결과 파일을 검증하는 중입니다.", current));
+  await requireFreshFile(top10CsvPath, "Transformer Top10 CSV", startedAt);
+  await requireFreshFile(step3CsvPath, "STEP3 LLM CSV result", startedAt);
+  await requireFreshFile(step3JsonPath, "STEP3 LLM JSON result", startedAt);
 
+  updateCandidateAnalysisProgress((current) => progressSnapshot(6, 98, "분석 결과를 대시보드 데이터로 변환하는 중입니다.", current));
   const rows = await getCandidatesPayload();
-  if (rows.length === 0) {
-    throw new Error(`Pipeline finished, but no candidate rows were found in ${outputJsonPath} or ${outputCsvPath}.`);
-  }
 
   return {
     dashboardUpdated: await refreshDashboardAiFieldsFromPipelineOutput(),
     elapsedMs: Date.now() - startedAt,
-    outputCsvPath,
-    outputJsonPath: outputCsvPath,
     rows: rows.length,
-    newsRows,
+    newsRows: await countJsonObjectRows(step3JsonPath),
     status: "completed",
   };
 }
@@ -317,28 +419,35 @@ export type CandidateAnalysisStatus = {
   startedAt?: number;
   finishedAt?: number;
   elapsedMs?: number;
+  progress?: CandidateAnalysisProgress;
   result?: CandidateAnalysisRunResult;
   error?: string;
 };
 
 type RunState =
   | { status: "idle" }
-  | { status: "running"; startedAt: number }
-  | { status: "completed"; startedAt: number; finishedAt: number; result: CandidateAnalysisRunResult }
-  | { status: "failed"; startedAt: number; finishedAt: number; error: string };
+  | { status: "running"; startedAt: number; progress: CandidateAnalysisProgress }
+  | { status: "completed"; startedAt: number; finishedAt: number; progress: CandidateAnalysisProgress; result: CandidateAnalysisRunResult }
+  | { status: "failed"; startedAt: number; finishedAt: number; progress: CandidateAnalysisProgress; error: string };
 
 let runState: RunState = { status: "idle" };
 
 export function getCandidateAnalysisStatus(): CandidateAnalysisStatus {
   switch (runState.status) {
     case "running":
-      return { status: "running", startedAt: runState.startedAt, elapsedMs: Date.now() - runState.startedAt };
+      return {
+        status: "running",
+        startedAt: runState.startedAt,
+        elapsedMs: Date.now() - runState.startedAt,
+        progress: runState.progress,
+      };
     case "completed":
       return {
         status: "completed",
         startedAt: runState.startedAt,
         finishedAt: runState.finishedAt,
         elapsedMs: runState.finishedAt - runState.startedAt,
+        progress: runState.progress,
         result: runState.result,
       };
     case "failed":
@@ -347,6 +456,7 @@ export function getCandidateAnalysisStatus(): CandidateAnalysisStatus {
         startedAt: runState.startedAt,
         finishedAt: runState.finishedAt,
         elapsedMs: runState.finishedAt - runState.startedAt,
+        progress: runState.progress,
         error: runState.error,
       };
     default:
@@ -362,19 +472,31 @@ export function getCandidateAnalysisStatus(): CandidateAnalysisStatus {
 export function startCandidateAnalysis(env = process.env): CandidateAnalysisStatus {
   if (!activeRun) {
     const startedAt = Date.now();
-    runState = { status: "running", startedAt };
+    runState = { status: "running", startedAt, progress: initialProgress() };
 
     activeRun = executeCandidateAnalysis(env);
     activeRun
       .then((result) => {
-        runState = { status: "completed", startedAt, finishedAt: Date.now(), result };
+        const progress =
+          runState.status === "running"
+            ? progressSnapshot(6, 100, "분석이 완료되었습니다.", runState.progress)
+            : progressSnapshot(6, 100, "분석이 완료되었습니다.");
+        runState = { status: "completed", startedAt, finishedAt: Date.now(), progress, result };
       })
       .catch((error: unknown) => {
+        const privateMessage = error instanceof Error ? error.message : String(error);
+        const publicMessage = publicCandidateAnalysisError(error);
+        console.error(`[pipeline] Candidate analysis failed: ${privateMessage}`);
+        const progress =
+          runState.status === "running"
+            ? progressSnapshot(runState.progress.stageIndex, runState.progress.progressPercent, "분석 중 오류가 발생했습니다.", runState.progress)
+            : progressSnapshot(0, 0, "분석 중 오류가 발생했습니다.");
         runState = {
           status: "failed",
           startedAt,
           finishedAt: Date.now(),
-          error: error instanceof Error ? error.message : String(error),
+          progress,
+          error: publicMessage,
         };
       })
       .finally(() => {

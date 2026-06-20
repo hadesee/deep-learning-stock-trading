@@ -155,7 +155,7 @@ export function StockChartPanel({ stock }: StockChartPanelProps) {
 
       {bundle.warning ? (
         <p className="stock-chart-warning">
-          KIS 차트 응답을 사용할 수 없어 임시 차트를 표시합니다. 원인: {bundle.warning}
+          KIS 실시간 차트 응답이 지연되어 현재가 기준 대체 차트를 표시합니다.
         </p>
       ) : null}
 

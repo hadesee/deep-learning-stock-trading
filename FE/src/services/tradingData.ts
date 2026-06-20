@@ -278,9 +278,6 @@ const CANDIDATE_ANALYSIS_TIMEOUT_MS = 60 * 60 * 1000;
 export type CandidateAnalysisRunResult = {
   dashboardUpdated: boolean;
   elapsedMs: number;
-  inputJsonPath?: string;
-  outputCsvPath?: string;
-  outputJsonPath: string;
   rows: number;
   /** Stocks the Gemini news step analyzed; 0 when skipped or unavailable. */
   newsRows?: number;
@@ -422,10 +419,14 @@ export async function fetchLandingData(signal?: AbortSignal): Promise<LandingDat
  * `input_row` model metadata, and the `news` list). Falls back to bundled mock
  * pipeline output when the backend is unavailable so the page still renders.
  */
-export async function fetchPipelineCandidates(signal?: AbortSignal): Promise<PipelineOutputRow[]> {
+export async function fetchPipelineCandidates(
+  signal?: AbortSignal,
+  options: { fallbackToMock?: boolean } = {},
+): Promise<PipelineOutputRow[]> {
+  const { fallbackToMock = true } = options;
   try {
     const rows = await fetchJson<PipelineOutputRow[]>("/api/candidates", signal, API_BASE_URL);
-    if (Array.isArray(rows) && rows.length > 0) {
+    if (Array.isArray(rows)) {
       return rows;
     }
   } catch (error) {
@@ -436,9 +437,13 @@ export async function fetchPipelineCandidates(signal?: AbortSignal): Promise<Pip
     if (import.meta.env.DEV) {
       console.warn("Candidates API unavailable. Falling back to mock data.", error);
     }
+
+    if (!fallbackToMock) {
+      throw error;
+    }
   }
 
-  return mockPipelineResults;
+  return fallbackToMock ? mockPipelineResults : [];
 }
 
 /** Loads one stock from the full Transformer ranking, not only the final Top10. */
@@ -495,14 +500,42 @@ export async function runStockNewsAnalysis(ticker: string, signal?: AbortSignal)
   throw new Error(`${normalized} 뉴스 분석 시간이 초과되었습니다.`);
 }
 
-type CandidateAnalysisStatus = {
+export type CandidateAnalysisProgress = {
+  stage: string;
+  stageCount: number;
+  stageIndex: number;
+  progressPercent: number;
+  message: string;
+  updatedAt: number;
+};
+
+export type CandidateAnalysisStatus = {
   status: "idle" | "running" | "completed" | "failed";
+  elapsedMs?: number;
+  progress?: CandidateAnalysisProgress;
   result?: CandidateAnalysisRunResult;
   error?: string;
 };
 
 /** Gap between status polls while the background analysis is running. */
 const CANDIDATE_ANALYSIS_POLL_MS = 5000;
+const CANDIDATE_ANALYSIS_STALE_MS = 5 * 60 * 1000;
+const CANDIDATE_ANALYSIS_PROGRESS_STALE_MS = 3 * 60 * 1000;
+
+export async function fetchCandidateAnalysisStatus(signal?: AbortSignal): Promise<CandidateAnalysisStatus> {
+  const baseUrl = isLiveApiEnabled() ? API_BASE_URL : "";
+  return fetchJson<CandidateAnalysisStatus>("/api/candidates/run", signal, baseUrl, REQUEST_TIMEOUT_MS);
+}
+
+function isStaleCandidateAnalysis(status: CandidateAnalysisStatus): boolean {
+  if (status.status !== "running") {
+    return false;
+  }
+
+  const elapsedMs = status.elapsedMs ?? 0;
+  const progressAgeMs = status.progress?.updatedAt ? Date.now() - status.progress.updatedAt : elapsedMs;
+  return elapsedMs >= CANDIDATE_ANALYSIS_STALE_MS && progressAgeMs >= CANDIDATE_ANALYSIS_PROGRESS_STALE_MS;
+}
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -531,11 +564,18 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
  * kicks off the background job with a short POST, then polls the status endpoint
  * with quick requests until it completes or fails.
  */
-export async function runCandidateAnalysis(signal?: AbortSignal): Promise<CandidateAnalysisRunResult> {
+export async function runCandidateAnalysis(
+  signal?: AbortSignal,
+  onStatus?: (status: CandidateAnalysisStatus) => void,
+): Promise<CandidateAnalysisRunResult> {
   const baseUrl = isLiveApiEnabled() ? API_BASE_URL : "";
 
   // Start (or re-attach to) the background run. Returns immediately.
-  await postJson<CandidateAnalysisStatus>("/api/candidates/run", signal, baseUrl, REQUEST_TIMEOUT_MS);
+  const started = await postJson<CandidateAnalysisStatus>("/api/candidates/run", signal, baseUrl, REQUEST_TIMEOUT_MS);
+  onStatus?.(started);
+  if (isStaleCandidateAnalysis(started)) {
+    throw new Error("이전 AI 분석 실행이 오래 응답하지 않습니다. 최근 결과를 확인합니다.");
+  }
 
   const deadline = Date.now() + CANDIDATE_ANALYSIS_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -547,6 +587,10 @@ export async function runCandidateAnalysis(signal?: AbortSignal): Promise<Candid
       baseUrl,
       REQUEST_TIMEOUT_MS,
     );
+    onStatus?.(status);
+    if (isStaleCandidateAnalysis(status)) {
+      throw new Error("이전 AI 분석 실행이 오래 응답하지 않습니다. 최근 결과를 확인합니다.");
+    }
 
     if (status.status === "completed" && status.result) {
       return status.result;

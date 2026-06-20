@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import type { MarketDashboardData, MarketDirection, StockQuote } from "../../types/trading";
+import type { MarketDashboardData, StockQuote } from "../../types/trading";
 import { readWatchlistCodes, writeWatchlistCodes } from "../../services/tradingData";
+import type { CandidateAnalysisProgress } from "../../services/tradingData";
 import { describeAiSummary } from "../../utils/aiSignal";
+import { AnalysisResults } from "./AnalysisResults";
 
 type MarketFilter = "ALL" | "AI" | "UP" | "DOWN" | "FOREIGN" | "INSTITUTION";
 type TableDensity = "comfortable" | "compact";
@@ -23,10 +25,12 @@ export type DashboardSyncStatus = {
 };
 
 export type DashboardCandidateAnalysisStatus = {
+  elapsedMs?: number;
   errorMessage?: string;
   isRunning: boolean;
   message?: string;
   onRun: () => void;
+  progress?: CandidateAnalysisProgress;
 };
 
 const navItems = [
@@ -81,16 +85,169 @@ function formatRate(value: number) {
   return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function buildSmoothPath(points: Array<{ x: number; y: number }>) {
+  if (points.length === 0) {
+    return "";
+  }
+
+  if (points.length === 1) {
+    return `M ${points[0].x} ${points[0].y}`;
+  }
+
+  const segments = points.slice(0, -1).map((point, index) => {
+    const previous = points[index - 1] ?? point;
+    const next = points[index + 1];
+    const afterNext = points[index + 2] ?? next;
+    const cp1x = point.x + (next.x - previous.x) / 6;
+    const cp1y = point.y + (next.y - previous.y) / 6;
+    const cp2x = next.x - (afterNext.x - point.x) / 6;
+    const cp2y = next.y - (afterNext.y - point.y) / 6;
+
+    return `C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(2)} ${cp2y.toFixed(2)}, ${next.x.toFixed(2)} ${next.y.toFixed(2)}`;
+  });
+
+  return `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)} ${segments.join(" ")}`;
+}
+
+function buildIndexChartGeometry(series: number[], direction: MarketDashboardData["indices"][number]["direction"]) {
+  const source = series.length > 1 ? series : [series[0] ?? 0, series[0] ?? 0];
+  const high = Math.max(...source);
+  const low = Math.min(...source);
+  const range = Math.max(high - low, 1);
+  const points = source.map((value, pointIndex) => {
+    const x = 4 + (pointIndex / Math.max(source.length - 1, 1)) * 92;
+
+    return {
+      x,
+      y: clamp(66 - ((value - low) / range) * 48, 12, 68),
+    };
+  });
+  const linePath = buildSmoothPath(points);
+  const first = points[0];
+  const last = points[points.length - 1];
+
+  return {
+    areaPath: `${linePath} L ${last.x.toFixed(2)} 74 L ${first.x.toFixed(2)} 74 Z`,
+    first,
+    last,
+    linePath,
+  };
+}
+
+type MarketRegimeView = {
+  action: string;
+  label: string;
+  note: string;
+  reasons: string[];
+  score: number;
+  tone: "down" | "neutral" | "up";
+};
+
+function percentChange(from: number, to: number) {
+  if (!Number.isFinite(from) || Math.abs(from) < 0.000001) {
+    return 0;
+  }
+
+  return ((to - from) / Math.abs(from)) * 100;
+}
+
+function normalizedSeriesSlope(series: number[]) {
+  if (series.length < 2) {
+    return 0;
+  }
+
+  const first = series[0] ?? 0;
+  const last = series[series.length - 1] ?? first;
+  const high = Math.max(...series);
+  const low = Math.min(...series);
+  const range = Math.max(high - low, Math.abs(first) * 0.01, 1);
+  return clamp((last - first) / range, -1, 1);
+}
+
+function describeTrend(changeRate: number, slope: number) {
+  const combined = changeRate * 0.22 + slope * 0.8;
+  if (combined >= 0.7) {
+    return "단기 추세 개선";
+  }
+  if (combined <= -0.7) {
+    return "단기 추세 약화";
+  }
+  return "단기 추세 혼조";
+}
+
+function buildMarketRegime(index: MarketDashboardData["indices"][number]): MarketRegimeView {
+  const series = index.miniSeries.length > 1 ? index.miniSeries : [index.value - index.change, index.value];
+  const slope = normalizedSeriesSlope(series);
+  const previousValue = index.value - index.change;
+  const valueChangeRate = percentChange(previousValue, index.value);
+  const displayChangeRate = Number.isFinite(index.changeRate) && index.changeRate !== 0 ? index.changeRate : valueChangeRate;
+  const rawScore = 50 + displayChangeRate * 4 + slope * 10;
+  const score = Math.round(clamp(rawScore, 0, 100));
+  const trendText = describeTrend(displayChangeRate, slope);
+  const flowText = slope > 0.2 ? "최근 지수 흐름 상승세" : slope < -0.2 ? "최근 지수 흐름 하락세" : "최근 지수 흐름 혼조";
+
+  if (score >= 62) {
+    return {
+      action: "선별 매수 환경",
+      label: "상승 우위",
+      note: "지수 흐름이 개선될 때는 AI 후보 중 수급과 뉴스가 함께 받쳐주는 종목을 우선 확인합니다.",
+      reasons: [
+        `${index.symbol} 전일 대비 ${formatRate(displayChangeRate)}`,
+        flowText,
+        trendText,
+      ],
+      score,
+      tone: "up",
+    };
+  }
+
+  if (score <= 42) {
+    return {
+      action: "관망 우위",
+      label: "하락 압력",
+      note: "지수가 약할 때는 개별 후보가 있더라도 진입 강도를 낮추고 근거가 강한 종목만 선별하는 접근이 유리합니다.",
+      reasons: [
+        `${index.symbol} 전일 대비 ${formatRate(displayChangeRate)}`,
+        flowText,
+        trendText,
+      ],
+      score,
+      tone: "down",
+    };
+  }
+
+  return {
+    action: "보수적 선별",
+    label: "중립 장세",
+    note: "지수 방향성이 뚜렷하지 않을 때는 상승 확률보다 뉴스와 수급 근거의 일치 여부를 더 엄격하게 확인합니다.",
+    reasons: [
+      `${index.symbol} 전일 대비 ${formatRate(displayChangeRate)}`,
+      flowText,
+      trendText,
+    ],
+    score,
+    tone: "neutral",
+  };
+}
+
 function normalizeSearch(value: string) {
   return value.replace(/\s+/g, "").toLowerCase();
 }
 
 function isAiCandidate(stock: StockQuote) {
-  if (stock.upProbability !== undefined && stock.upProbability !== null) {
-    return stock.sentimentLabel === "POSITIVE" && stock.upProbability >= 0.5;
+  if (stock.sentimentLabel === "NEGATIVE") {
+    return false;
   }
 
-  return stock.sentimentLabel === "POSITIVE" && (stock.predictedReturn ?? 0) >= 0.4;
+  if (stock.upProbability !== undefined && stock.upProbability !== null) {
+    return stock.upProbability >= 0.5 || stock.sentimentLabel === "NEUTRAL";
+  }
+
+  return stock.sentimentLabel === "NEUTRAL" || (stock.predictedReturn ?? 0) >= 0.4;
 }
 
 function getSortValue(stock: StockQuote, field: SortField) {
@@ -115,25 +272,6 @@ function getSortValue(stock: StockQuote, field: SortField) {
   }
 
   return stock.tradingValue;
-}
-
-function MiniSparkline({ values, direction }: { values: number[]; direction: MarketDirection }) {
-  const max = Math.max(...values);
-  const min = Math.min(...values);
-  const range = Math.max(max - min, 1);
-  const points = values
-    .map((value, index) => {
-      const x = (index / Math.max(values.length - 1, 1)) * 100;
-      const y = 36 - ((value - min) / range) * 32;
-      return `${x},${y}`;
-    })
-    .join(" ");
-
-  return (
-    <svg className={`sparkline sparkline--${direction}`} viewBox="0 0 100 40" aria-hidden="true">
-      <polyline points={points} fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="3" />
-    </svg>
-  );
 }
 
 function MarketTopBar({
@@ -247,35 +385,106 @@ function MarketTopBar({
 }
 
 function IndexCard({ index }: { index: MarketDashboardData["indices"][number] }) {
+  const chart = useMemo(
+    () => buildIndexChartGeometry(index.miniSeries, index.direction),
+    [index.direction, index.miniSeries],
+  );
+  const gradientKey = index.symbol.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  const areaGradientId = `index-area-${gradientKey}`;
+  const lineGradientId = `index-line-${gradientKey}`;
+  const previousValue = index.value - index.change;
+
   return (
-    <article className="index-card">
+    <article className={`index-card index-card--${index.direction}`}>
       <div className="index-card__title">
-        <span>{index.name}</span>
+        <span>
+          대표 지수
+          <em>KIS INDEX</em>
+        </span>
         <strong>{index.value.toLocaleString("ko-KR")}</strong>
       </div>
-      <MiniSparkline values={index.miniSeries} direction={index.direction} />
-      <p className={`market-change market-change--${index.direction}`}>
-        {index.change.toLocaleString("ko-KR")} ({formatRate(index.changeRate)})
+      <div className="index-card__meta">
+        <span className="index-card__name">
+          <b>{index.name}</b>
+          <small>전일 대비 추세</small>
+        </span>
+        <small className={`index-card__change market-change market-change--${index.direction}`}>
+          {index.change.toLocaleString("ko-KR")} ({formatRate(index.changeRate)})
+        </small>
+      </div>
+      <div className="index-card__chart-wrap">
+        <svg className="index-card__chart" viewBox="0 0 100 80" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <linearGradient id={areaGradientId} x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0%" stopColor="currentColor" stopOpacity="0.16" />
+              <stop offset="68%" stopColor="currentColor" stopOpacity="0.05" />
+              <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
+            </linearGradient>
+            <linearGradient id={lineGradientId} x1="0" x2="1" y1="0" y2="0">
+              <stop offset="0%" stopColor="currentColor" stopOpacity="0.72" />
+              <stop offset="100%" stopColor="currentColor" stopOpacity="1" />
+            </linearGradient>
+          </defs>
+          <path className="index-card__gridline" d="M 4 20 H 96 M 4 44 H 96 M 4 68 H 96" />
+          <path className="index-card__area" d={chart.areaPath} fill={`url(#${areaGradientId})`} />
+          <path className="index-card__line" d={chart.linePath} stroke={`url(#${lineGradientId})`} />
+        </svg>
+        <div className="index-card__chart-labels" aria-hidden="true">
+          <span>Prev {previousValue.toLocaleString("ko-KR")}</span>
+          <span>Now {index.value.toLocaleString("ko-KR")}</span>
+        </div>
+      </div>
+      <p className="index-card__caption">
+        KIS 지수 기준 · 전일 대비 추세
       </p>
     </article>
+  );
+}
+
+function MarketRegimeCard({ index }: { index: MarketDashboardData["indices"][number] }) {
+  const regime = buildMarketRegime(index);
+
+  return (
+    <aside className={`regime-card regime-card--${regime.tone}`} aria-label="KOSPI 시장 국면">
+      <div className="regime-card__head">
+        <div>
+          <span>KOSPI 시장 국면</span>
+          <strong>{regime.label}</strong>
+        </div>
+        <em>KIS INDEX</em>
+      </div>
+
+      <div className="regime-card__action">
+        <span>{regime.action}</span>
+        <b>{regime.score}점</b>
+      </div>
+
+      <div className="regime-card__meter" aria-hidden="true">
+        <i style={{ width: `${regime.score}%` }} />
+      </div>
+
+      <ul className="regime-card__reasons">
+        {regime.reasons.map((reason) => (
+          <li key={reason}>{reason}</li>
+        ))}
+      </ul>
+
+      <p>{regime.note}</p>
+    </aside>
   );
 }
 
 function MarketOverview({
   candidateAnalysis,
   data,
-  focused,
-  onNavigate,
-  onOpenDetail,
   syncStatus,
 }: {
   candidateAnalysis: DashboardCandidateAnalysisStatus;
   data: MarketDashboardData;
-  focused: StockQuote;
-  onNavigate: (sectionId: string) => void;
-  onOpenDetail: () => void;
   syncStatus: DashboardSyncStatus;
 }) {
+  const featuredIndices = data.indices.filter((index) => index.symbol === "KOSPI200");
+  const indices = featuredIndices.length > 0 ? featuredIndices : data.indices.slice(0, 1);
   const syncLabel = syncStatus.isRefreshing
     ? "KIS 동기화 중"
     : syncStatus.errorMessage
@@ -325,45 +534,50 @@ function MarketOverview({
       </div>
 
       <div className="overview-grid">
+        <MarketRegimeCard index={indices[0]} />
+
         <div className="index-grid">
-          {data.indices.map((index) => (
+          {indices.map((index) => (
             <IndexCard index={index} key={index.symbol} />
           ))}
         </div>
 
         <article className="ai-brief">
-          <span className="brief-chip">KOSPI AI</span>
-          <h1>거래대금과 수급으로 오늘의 후보 종목을 정렬합니다</h1>
-          <p>
-            한국투자증권 API에서 현재가와 거래대금을 받고, 개인·외국인·기관 순매수 흐름을 함께
-            보여주는 국내시장 전용 보드입니다.
-          </p>
-          <div className="brief-focus">
-            <span>선택 종목</span>
-            <strong>
-              {focused.name} {focused.code}
-            </strong>
-            <small>{describeAiSummary(focused)}</small>
-            <button type="button" onClick={onOpenDetail}>
-              포트폴리오 열기
-            </button>
-          </div>
-        </article>
-
-        <aside className="event-card" aria-label="주요 일정">
-          <div className="event-card__head">
-            <strong>주요 일정</strong>
-            <button aria-label="종목 목록으로 이동" onClick={() => onNavigate("market-table")} type="button">
-              ›
-            </button>
-          </div>
-          {data.events.map((event) => (
-            <p key={event.title}>
-              <span>{event.timeLabel}</span>
-              {event.title}
+          <span className="brief-chip">오늘의 AI 후보 요약</span>
+          <h1>
+            단기 예측에 특화된 AI가 <em>상승 가능성이 높은 종목</em>을 추천드립니다.
+          </h1>
+          <div className="brief-intro">
+            <p>
+              <strong>Transformer</strong>가 KOSPI200 전체 종목을 분석하고, 상승 가능성이 높은 종목을 1차 선별합니다.
             </p>
-          ))}
-        </aside>
+            <p>
+              이후 뉴스 감정, 수급, 거래량 변화를 함께 반영해 <strong>LLM 통합 분석</strong>으로 최종 후보를 정리합니다.
+            </p>
+          </div>
+          <ol className="brief-flow" aria-label="AI 후보 선정 순서">
+            <li>
+              <span>분석 대상</span>
+              <strong>KOSPI200 전체 종목</strong>
+            </li>
+            <li>
+              <span>1차 모델</span>
+              <strong>Transformer 상승 확률 예측</strong>
+            </li>
+            <li>
+              <span>보조 데이터</span>
+              <strong>거래량 변화 + 외국인·기관 수급</strong>
+            </li>
+            <li>
+              <span>2차 판단</span>
+              <strong>뉴스 감정 + LLM 통합 분석</strong>
+            </li>
+            <li>
+              <span>최종 후보</span>
+              <strong>Top 5 종목</strong>
+            </li>
+          </ol>
+        </article>
       </div>
     </section>
   );
@@ -702,11 +916,104 @@ function WatchlistRail({
   );
 }
 
+const analysisStages = [
+  "실행 준비",
+  "KOSPI200 후보 풀 로드",
+  "OHLCV 수집·Transformer 예측",
+  "외국인·기관 수급 조회",
+  "뉴스 크롤링",
+  "Gemini LLM 종합 판단",
+  "결과 파일 검증",
+];
+
+/**
+ * Gates the stock list behind the AI analysis action. Before analysis it shows a
+ * clear call to action; while running it shows scanning motion; once done the
+ * caller swaps in the real table.
+ */
+function AnalysisGate({
+  isRunning,
+  onRun,
+  phase,
+  progress,
+}: {
+  isRunning: boolean;
+  onRun: () => void;
+  phase: "idle" | "running" | "done";
+  progress?: CandidateAnalysisProgress;
+}) {
+  const [stage, setStage] = useState(0);
+
+  useEffect(() => {
+    if (phase !== "running") {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setStage((current) => (current + 1) % analysisStages.length);
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [phase]);
+
+  if (phase === "running") {
+    const activeStage = progress?.stageIndex ?? stage;
+    const progressPercent = progress?.progressPercent ?? Math.min(94, Math.round(((stage + 1) / analysisStages.length) * 100));
+    const stageMessage = progress?.message ?? `${analysisStages[stage]}…`;
+
+    return (
+      <section className="analysis-gate analysis-gate--running" aria-live="polite" aria-busy="true">
+        <div className="gate-scan" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </div>
+        <p className="gate-title">AI가 후보 종목을 분석하고 있습니다</p>
+        <p className="gate-stage" key={progress?.updatedAt ?? stage}>
+          {stageMessage}
+        </p>
+        <div className="gate-progress" role="status" aria-label={`분석 진행률 ${progressPercent}%`}>
+          <i style={{ width: `${progressPercent}%` }} />
+          <span>{progressPercent}%</span>
+        </div>
+        <ol className="gate-steps">
+          {analysisStages.map((label, index) => (
+            <li key={label} className={index < activeStage ? "is-done" : index === activeStage ? "is-active" : "is-pending"}>
+              <span aria-hidden="true" />
+              {label.replace(/하는 중$/, "")}
+            </li>
+          ))}
+        </ol>
+      </section>
+    );
+  }
+
+  return (
+    <section className="analysis-gate analysis-gate--idle">
+      <div className="gate-illus" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+        <span />
+      </div>
+      <h2>AI 분석을 진행하세요</h2>
+      <p>
+        아직 분석 전입니다. 아래 버튼을 누르면 코스피200 종목을 스캔해 단기 매수 후보를 근거와 함께
+        골라냅니다.
+      </p>
+      <button className="gate-cta" type="button" onClick={onRun} disabled={isRunning}>
+        <span className="gate-cta__dot" aria-hidden="true" />
+        AI 분석 시작
+      </button>
+    </section>
+  );
+}
+
 export function MarketWorkspace({
+  analysisPhase,
   candidateAnalysis,
   data,
   syncStatus,
 }: {
+  analysisPhase: "idle" | "running" | "done";
   candidateAnalysis: DashboardCandidateAnalysisStatus;
   data: MarketDashboardData;
   syncStatus: DashboardSyncStatus;
@@ -731,7 +1038,7 @@ export function MarketWorkspace({
     writeWatchlistCodes(watchCodes);
   }, [watchCodes]);
 
-  const selectedStock = data.stocks.find((stock) => stock.code === selectedCode) ?? data.stocks[0];
+  const selectedStock = data.stocks.find((stock) => stock.code === selectedCode) ?? data.stocks[0] ?? data.watchlist[0];
   const normalizedQuery = normalizeSearch(query);
 
   const searchResults = useMemo(() => {
@@ -912,32 +1219,20 @@ export function MarketWorkspace({
           <MarketOverview
             candidateAnalysis={candidateAnalysis}
             data={data}
-            focused={selectedStock}
-            onNavigate={navigateTo}
-            onOpenDetail={() => selectStock(selectedStock)}
             syncStatus={syncStatus}
           />
-          <div className="market-content-grid">
-            <StockTable
-              activeFilter={filter}
-              density={density}
-              onClearFilters={clearSearchAndFilters}
-              onDensityChange={setDensity}
-              onFilterChange={changeFilter}
-              onPageChange={changePage}
-              onSelectStock={(stock) => selectStock(stock)}
-              onSortChange={changeSort}
-              pageIndex={safePageIndex}
-              pageOffset={pageOffset}
-              pageSize={PAGE_SIZE}
-              selectedCode={selectedStock.code}
-              sortState={sortState}
-              stocks={paginatedStocks}
-              totalFilteredCount={visibleStocks.length}
-              totalPages={totalPages}
-              totalCount={data.stocks.length}
+          {analysisPhase === "done" ? (
+            <div className="market-content-grid">
+              <AnalysisResults stocks={data.stocks} onSelect={(stock) => selectStock(stock)} />
+            </div>
+          ) : (
+            <AnalysisGate
+              phase={analysisPhase}
+              isRunning={candidateAnalysis.isRunning}
+              onRun={candidateAnalysis.onRun}
+              progress={candidateAnalysis.progress}
             />
-          </div>
+          )}
         </div>
         <WatchlistRail
           isOpen={isWatchRailOpen}
