@@ -563,9 +563,11 @@ async function loadNewsResult(): Promise<Map<string, GeminiNewsEntry> | null> {
   return latest?.map ?? null;
 }
 
-/** Overlays the Gemini news result onto candidate rows, matched by ticker. */
-async function overlayNewsResult(rows: PipelineOutputRow[]): Promise<PipelineOutputRow[]> {
-  const news = await loadNewsResult();
+/** Applies an already-loaded Gemini result without re-reading the output file. */
+function applyNewsResult(
+  rows: PipelineOutputRow[],
+  news: Map<string, GeminiNewsEntry> | null,
+): PipelineOutputRow[] {
   if (!news) {
     return rows;
   }
@@ -575,6 +577,11 @@ async function overlayNewsResult(rows: PipelineOutputRow[]): Promise<PipelineOut
     const entry = news.get(ticker);
     return entry ? applyNewsToRow(row, entry) : row;
   });
+}
+
+/** Overlays the Gemini news result onto candidate rows, matched by ticker. */
+async function overlayNewsResult(rows: PipelineOutputRow[]): Promise<PipelineOutputRow[]> {
+  return applyNewsResult(rows, await loadNewsResult());
 }
 
 async function loadBaseRows(): Promise<PipelineOutputRow[] | null> {
@@ -634,15 +641,17 @@ export async function loadPipelineRows(): Promise<PipelineOutputRow[] | null> {
  * otherwise an empty array. The frontend decides whether to fall back to mock.
  */
 export async function getCandidatesPayload(): Promise<PipelineOutputRow[]> {
-  const rows = await loadPipelineRows();
-  if (!rows) {
+  const baseRows = await loadBaseRows();
+  if (!baseRows) {
     return [];
   }
 
   const news = await loadNewsResult();
   if (!news) {
-    return rows;
+    return baseRows;
   }
+
+  const rows = applyNewsResult(baseRows, news);
 
   return sortRowsByLlmScoreThenRank(
     rows.filter((row) => isDisplayableLlmEntry(news.get(tickerFromRow(row)))),

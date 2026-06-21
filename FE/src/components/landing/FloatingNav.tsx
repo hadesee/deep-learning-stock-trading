@@ -32,7 +32,7 @@ export function FloatingNav() {
         </ul>
 
         <div className="nav-actions">
-          <Link className="pill-button pill-button--primary" state={{ resetAnalysis: true }} to="/dashboard">
+          <Link className="pill-button pill-button--primary" to="/dashboard">
             대시보드 시작하기
           </Link>
           <button
@@ -54,7 +54,7 @@ export function FloatingNav() {
               {item.label}
             </a>
           ))}
-          <Link className="pill-button pill-button--primary" state={{ resetAnalysis: true }} to="/dashboard" role="menuitem" onClick={closeMenu}>
+          <Link className="pill-button pill-button--primary" to="/dashboard" role="menuitem" onClick={closeMenu}>
             대시보드 시작하기
           </Link>
         </div>

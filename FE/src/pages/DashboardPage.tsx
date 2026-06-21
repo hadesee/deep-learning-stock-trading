@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
 import { MarketWorkspace } from "../components/market/MarketWorkspace";
 import { usePageTitle } from "../hooks/usePageTitle";
 import {
@@ -15,11 +14,11 @@ import { overlayLiveAnalysis } from "../data/pipelineAdapter";
 import type { CandidateAnalysisStatus } from "../services/tradingData";
 import type { MarketDashboardData, PipelineOutputRow, StockQuote } from "../types/trading";
 
-type AnalysisPhase = "idle" | "running" | "done";
+type AnalysisPhase = "idle" | "restoring" | "running" | "done";
 
 const ANALYSIS_CACHE_KEY = "kospi-dashboard-analysis.v1";
 
-/** Candidate price hydration: retry stragglers a few times to ride out KIS rate-limit contention. */
+/** Candidate price loading: retry stragglers a few times to ride out KIS rate-limit contention. */
 const HYDRATE_MAX_ATTEMPTS = 3;
 const HYDRATE_RETRY_DELAY_MS = 2500;
 
@@ -80,39 +79,25 @@ function clearCachedAnalysisRows(): void {
 export function DashboardPage() {
   usePageTitle("실시간 대시보드");
 
-  const location = useLocation();
-  const navigate = useNavigate();
-  const resetAnalysis = (location.state as { resetAnalysis?: boolean } | null)?.resetAnalysis === true;
-  const [cachedRows] = useState<PipelineOutputRow[] | null>(() => {
-    if (resetAnalysis) {
-      clearCachedAnalysisRows();
-      return null;
-    }
-
-    return readCachedAnalysisRows();
-  });
+  const [cachedRows] = useState<PipelineOutputRow[] | null>(() => readCachedAnalysisRows());
   const [data, setData] = useState<MarketDashboardData>(() => {
-    const base = getMarketDashboardData();
-    return cachedRows ? overlayLiveAnalysis(base, cachedRows) : base;
+    // Do not expose cached candidates until every row has a real quote. Rendering
+    // the overlay here creates price-less placeholder rows on the first paint.
+    return getMarketDashboardData();
   });
-  const [analysisPhase, setAnalysisPhase] = useState<AnalysisPhase>(cachedRows ? "done" : "idle");
-  const [isAnalysisRunning, setAnalysisRunning] = useState(false);
+  // Probe reusable server outputs before showing the empty analysis gate. This
+  // avoids asking for a new paid API run when a completed output already exists.
+  const [analysisPhase, setAnalysisPhase] = useState<AnalysisPhase>("restoring");
+  const [isAnalysisRunning, setAnalysisRunning] = useState(true);
   const [analysisMessage, setAnalysisMessage] = useState<string | undefined>(
-    cachedRows ? `분석 결과 유지 중 — 후보 ${cachedRows.length}개.` : undefined,
+    cachedRows ? `저장된 후보 ${cachedRows.length}종목을 복원하는 중입니다.` : "기존 AI 분석 산출물을 확인하는 중입니다.",
   );
   const [analysisErrorMessage, setAnalysisErrorMessage] = useState<string | undefined>();
   const [analysisStatus, setAnalysisStatus] = useState<CandidateAnalysisStatus | undefined>();
   const [isRefreshing, setRefreshing] = useState(false);
   const [refreshErrorMessage, setRefreshErrorMessage] = useState<string | undefined>();
   const analysisRunRef = useRef(0);
-
-  useEffect(() => {
-    if (!resetAnalysis) {
-      return;
-    }
-
-    navigate(`${location.pathname}${location.search}${location.hash}`, { replace: true, state: null });
-  }, [location.hash, location.pathname, location.search, navigate, resetAnalysis]);
+  const analysisRowsRef = useRef<PipelineOutputRow[] | null>(cachedRows);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -133,37 +118,81 @@ export function DashboardPage() {
     return () => controller.abort();
   }, []);
 
-  // When restoring a cached analysis on mount, the overlay starts on the mock
-  // base (placeholder prices). Hydrate the candidate list with live KIS prices.
+  // Treat the completed/validated pipeline output served from outputs/ as the
+  // source of truth. The in-tab cache is only a network-failure fallback; using
+  // it first could hide a newer run produced in another tab or process.
   useEffect(() => {
-    if (!cachedRows || cachedRows.length === 0) {
-      return;
-    }
+    const controller = new AbortController();
+    const runId = analysisRunRef.current;
+    void (async () => {
+      let rows: PipelineOutputRow[];
+      try {
+        rows = await fetchPipelineCandidates(controller.signal, { fallbackToMock: false });
+      } catch (cause) {
+        if (!cachedRows) {
+          throw cause;
+        }
+        rows = cachedRows;
+      }
+      if (analysisRunRef.current !== runId) {
+        return;
+      }
+      if (rows.length === 0 || !looksLikeLiveRows(rows)) {
+        analysisRowsRef.current = null;
+        clearCachedAnalysisRows();
+        setAnalysisMessage(undefined);
+        setAnalysisPhase("idle");
+        return;
+      }
 
-    void hydrateCandidatePrices(cachedRows, analysisRunRef.current);
-    // Run once on mount for the restored rows.
+      await publishResults(rows, `기존 분석 산출물 재사용 · 후보 ${rows.length}종목`);
+    })()
+      .catch((cause) => {
+        if (analysisRunRef.current !== runId) {
+          return;
+        }
+        if (cause instanceof DOMException && cause.name === "AbortError") {
+          return;
+        }
+        setAnalysisMessage(undefined);
+        setAnalysisErrorMessage(cause instanceof Error ? cause.message : "기존 분석 산출물을 불러오지 못했습니다.");
+        setAnalysisPhase("idle");
+      })
+      .finally(() => {
+        if (analysisRunRef.current === runId) {
+          setAnalysisRunning(false);
+        }
+      });
+    return () => {
+      controller.abort();
+      if (analysisRunRef.current === runId) {
+        analysisRunRef.current += 1;
+      }
+    };
+    // Run once on mount for cached or server-side outputs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /**
-   * Replaces the candidate list's placeholder/mock prices with live KIS quotes.
-   * Fire-and-forget: the board renders immediately with placeholder prices, then
-   * re-renders with real prices once the KIS quote calls resolve. Guarded by
-   * `runId` so a newer run/refresh isn't clobbered by a late hydration.
+   * Loads a complete quote set before the candidate list is allowed to render.
+   * KIS requests remain batched/rate-limit aware server-side; only unresolved
+   * tickers are retried. A partial map is never published to the UI.
    */
-  async function hydrateCandidatePrices(rows: PipelineOutputRow[], runId: number): Promise<void> {
-    const codes = rows
-      .map((row) => String(row.result?.ticker ?? row.input_row?.ticker ?? "").replace(/\D/g, "").padStart(6, "0").slice(-6))
-      .filter((code) => /^\d{6}$/.test(code) && code !== "000000");
+  async function loadCompleteCandidateQuotes(
+    rows: PipelineOutputRow[],
+    runId: number,
+  ): Promise<Map<string, StockQuote> | null> {
+    const codes = Array.from(new Set(
+      rows
+        .map((row) => String(row.result?.ticker ?? row.input_row?.ticker ?? "").replace(/\D/g, "").padStart(6, "0").slice(-6))
+        .filter((code) => /^\d{6}$/.test(code) && code !== "000000"),
+    ));
     if (codes.length === 0) {
-      return;
+      return new Map();
     }
 
-    // Accumulate across attempts. A straggler can fail on the first pass when the
-    // background snapshot warm is saturating the KIS rate limit; refetch only the
-    // still-missing codes (cheap, snapshot-first) so all candidates end up with a
-    // real price instead of getting stuck below the full count.
     const merged = new Map<string, StockQuote>();
+    let lastError: unknown;
     for (let attempt = 0; attempt < HYDRATE_MAX_ATTEMPTS; attempt += 1) {
       const missing = codes.filter((code) => !merged.has(code));
       if (missing.length === 0) {
@@ -173,25 +202,53 @@ export function DashboardPage() {
       try {
         const quotes = await fetchCandidateQuotes(missing);
         if (analysisRunRef.current !== runId) {
-          return;
+          return null;
         }
         for (const [code, quote] of quotes) {
-          merged.set(code, quote);
+          if (quote.currentPrice > 0) {
+            merged.set(code, quote);
+          }
         }
-        if (quotes.size > 0) {
-          setData((base) => overlayLiveAnalysis(base, rows, merged));
-        }
-      } catch {
-        // Keep placeholder prices for this pass; a later attempt may succeed.
+      } catch (cause) {
+        lastError = cause;
       }
 
       if (attempt < HYDRATE_MAX_ATTEMPTS - 1 && merged.size < codes.length) {
         await new Promise((resolve) => setTimeout(resolve, HYDRATE_RETRY_DELAY_MS));
         if (analysisRunRef.current !== runId) {
-          return;
+          return null;
         }
       }
     }
+
+    const missing = codes.filter((code) => !merged.has(code));
+    if (missing.length > 0) {
+      const detail = lastError instanceof Error ? ` (${lastError.message})` : "";
+      throw new Error(`후보 ${codes.length}종목 중 ${missing.length}종목의 현재가를 확보하지 못했습니다: ${missing.join(", ")}${detail}`);
+    }
+
+    return merged;
+  }
+
+  async function publishResults(
+    rows: PipelineOutputRow[],
+    note: string,
+    baseData?: MarketDashboardData,
+  ): Promise<boolean> {
+    const runId = analysisRunRef.current;
+    analysisRowsRef.current = rows;
+    writeCachedAnalysisRows(rows);
+    setAnalysisMessage(`AI 분석 완료 · 후보 ${rows.length}종목의 현재가를 확인하는 중입니다.`);
+
+    const quotes = await loadCompleteCandidateQuotes(rows, runId);
+    if (!quotes || analysisRunRef.current !== runId) {
+      return false;
+    }
+
+    setData((base) => overlayLiveAnalysis(baseData ?? base, rows, quotes));
+    setAnalysisMessage(note);
+    setAnalysisPhase("done");
+    return true;
   }
 
   /** Loads the freshly generated outputs and reveals the board. Returns true on success. */
@@ -200,12 +257,7 @@ export function DashboardPage() {
     if (!looksLikeLiveRows(rows)) {
       return false;
     }
-    writeCachedAnalysisRows(rows);
-    setData((base) => overlayLiveAnalysis(base, rows));
-    setAnalysisMessage(note);
-    setAnalysisPhase("done");
-    void hydrateCandidatePrices(rows, analysisRunRef.current);
-    return true;
+    return publishResults(rows, note);
   }
 
   async function handleRefreshDashboard() {
@@ -213,24 +265,37 @@ export function DashboardPage() {
       return;
     }
 
-    analysisRunRef.current += 1;
-    clearCachedAnalysisRows();
-    setAnalysisRunning(false);
-    setAnalysisPhase("idle");
-    setAnalysisMessage(undefined);
+    const refreshRunId = analysisRunRef.current + 1;
+    analysisRunRef.current = refreshRunId;
+    const rows = analysisRowsRef.current;
+    setAnalysisRunning(Boolean(rows));
+    setAnalysisMessage(rows ? "기존 AI 후보를 유지한 채 시세를 갱신하는 중입니다." : undefined);
     setAnalysisErrorMessage(undefined);
     setAnalysisStatus(undefined);
-    setData(getMarketDashboardData());
+    if (!rows) {
+      setAnalysisPhase("idle");
+      setData(getMarketDashboardData());
+    }
 
     setRefreshing(true);
     setRefreshErrorMessage(undefined);
     try {
       const refreshed = await fetchMarketDashboardData();
-      setData(refreshed);
+      if (rows) {
+        await publishResults(rows, `기존 분석 산출물 유지 · 후보 ${rows.length}종목`, refreshed);
+      } else {
+        setData(refreshed);
+      }
     } catch (cause) {
+      if (analysisRunRef.current !== refreshRunId) {
+        return;
+      }
       setRefreshErrorMessage(cause instanceof Error ? cause.message : "대시보드 새로고침에 실패했습니다.");
     } finally {
       setRefreshing(false);
+      if (analysisRunRef.current === refreshRunId) {
+        setAnalysisRunning(false);
+      }
     }
   }
 
@@ -241,6 +306,7 @@ export function DashboardPage() {
 
     const runId = analysisRunRef.current + 1;
     analysisRunRef.current = runId;
+    analysisRowsRef.current = null;
     clearCachedAnalysisRows();
     setData(getMarketDashboardData());
     setAnalysisRunning(true);
@@ -297,6 +363,7 @@ export function DashboardPage() {
       candidateAnalysis={{
         errorMessage: analysisErrorMessage,
         elapsedMs: analysisStatus?.elapsedMs,
+        isRestoring: analysisPhase === "restoring",
         isRunning: isAnalysisRunning,
         message: analysisMessage,
         onRun: handleRunCandidateAnalysis,

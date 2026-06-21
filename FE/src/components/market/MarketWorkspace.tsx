@@ -27,6 +27,7 @@ export type DashboardSyncStatus = {
 export type DashboardCandidateAnalysisStatus = {
   elapsedMs?: number;
   errorMessage?: string;
+  isRestoring?: boolean;
   isRunning: boolean;
   message?: string;
   onRun: () => void;
@@ -525,7 +526,7 @@ function MarketOverview({
           onClick={candidateAnalysis.onRun}
           type="button"
         >
-          {candidateAnalysis.isRunning ? "AI 분석 중" : "AI 후보 분석"}
+          {candidateAnalysis.isRestoring ? "기존 결과 확인 중" : candidateAnalysis.isRunning ? "AI 분석 중" : "AI 후보 분석"}
         </button>
         {candidateAnalysis.message ? (
           <span className="candidate-analysis-status" role="status">
@@ -950,7 +951,7 @@ function AnalysisGate({
 }: {
   isRunning: boolean;
   onRun: () => void;
-  phase: "idle" | "running" | "done";
+  phase: "idle" | "restoring" | "running" | "done";
   progress?: CandidateAnalysisProgress;
 }) {
   const [stage, setStage] = useState(0);
@@ -964,6 +965,20 @@ function AnalysisGate({
     }, 1500);
     return () => window.clearInterval(timer);
   }, [phase]);
+
+  if (phase === "restoring") {
+    return (
+      <section className="analysis-gate analysis-gate--running" aria-live="polite" aria-busy="true">
+        <div className="gate-scan" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </div>
+        <p className="gate-title">기존 AI 분석 결과를 확인하고 있습니다</p>
+        <p className="gate-stage">outputs 폴더의 완료된 산출물과 현재가를 불러오는 중입니다.</p>
+      </section>
+    );
+  }
 
   if (phase === "running") {
     const activeStage = progress?.stageIndex ?? stage;
@@ -1024,7 +1039,7 @@ export function MarketWorkspace({
   data,
   syncStatus,
 }: {
-  analysisPhase: "idle" | "running" | "done";
+  analysisPhase: "idle" | "restoring" | "running" | "done";
   candidateAnalysis: DashboardCandidateAnalysisStatus;
   data: MarketDashboardData;
   syncStatus: DashboardSyncStatus;

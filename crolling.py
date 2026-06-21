@@ -48,6 +48,11 @@ def resolve_llm_concurrency(value: int | None = None) -> int:
             value = 3
     return max(1, min(10, int(value)))
 
+
+def verbose_llm_output_enabled() -> bool:
+    """Keep large per-stock JSON diagnostics opt-in; result files are unchanged."""
+    return os.getenv("PIPELINE_VERBOSE_LLM_OUTPUT", "").strip().lower() in {"1", "true", "yes", "on"}
+
 def clean_scalar(value):
     if value is None:
         return None
@@ -233,8 +238,9 @@ def analyze_stock_with_llm(ticker: str, news_list: list[dict], tech_data_map: di
     final_sentiment = evaluation.get("final_sentiment") or evaluation.get("sentiment", "")
     final_score = evaluation.get("final_combined_score", evaluation.get("impact_score", 0))
     print(f"    [최종 결과] 방향성: {final_sentiment}, 종합 점수: {final_score}점")
-    print("    [Gemini 종합 분석]")
-    print(json.dumps(evaluation, ensure_ascii=False, indent=2))
+    if verbose_llm_output_enabled():
+        print("    [Gemini 종합 분석]")
+        print(json.dumps(evaluation, ensure_ascii=False, indent=2))
 
     return ticker, {
         "ticker": ticker,
