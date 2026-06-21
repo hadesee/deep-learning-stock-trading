@@ -529,6 +529,41 @@ export async function fetchStockQuoteData(ticker: string, signal?: AbortSignal):
   }
 }
 
+/**
+ * Real KIS quotes for the given stock codes, used to replace the AI candidate
+ * list's placeholder/mock prices with live prices (see `overlayLiveAnalysis`).
+ *
+ * Uses the batch endpoint, which fetches the codes SEQUENTIALLY server-side
+ * (rate-limit aware). Firing one request per ticker concurrently tripped the KIS
+ * "초당 거래건수" limit, so a single batched call is intentional. Quotes that fail
+ * or are unavailable are simply omitted from the map.
+ */
+export async function fetchCandidateQuotes(
+  codes: string[],
+  signal?: AbortSignal,
+): Promise<Map<string, StockQuote>> {
+  const unique = Array.from(
+    new Set(codes.map((code) => code.replace(/\D/g, "").padStart(6, "0").slice(-6))),
+  ).filter((code) => /^\d{6}$/.test(code) && code !== "000000");
+
+  if (unique.length === 0) {
+    return new Map();
+  }
+
+  const quotes = await fetchJson<StockQuote[]>(
+    `/api/korean-market/quotes?symbols=${encodeURIComponent(unique.join(","))}`,
+    signal,
+    isLiveApiEnabled() ? API_BASE_URL : "",
+    DASHBOARD_REQUEST_TIMEOUT_MS,
+  );
+
+  return new Map(
+    (Array.isArray(quotes) ? quotes : [])
+      .filter((quote) => quote && typeof quote.code === "string")
+      .map((quote) => [quote.code.padStart(6, "0"), quote] as const),
+  );
+}
+
 type StockNewsAnalysisStatus = {
   status: "idle" | "running" | "completed" | "failed";
   ticker: string;

@@ -38,6 +38,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import requests
 
 try:
     from dotenv import load_dotenv
@@ -59,12 +60,27 @@ MIN_OHLCV_ROWS            = 60
 SUPPLY_REQUEST_SLEEP_SECONDS = float(os.getenv("KIS_SUPPLY_SLEEP_SECONDS", "0.3"))
 SUPPLY_REQUEST_TIMEOUT_SECONDS = float(os.getenv("KIS_SUPPLY_TIMEOUT_SECONDS", "5"))
 SUPPLY_MAX_RETRIES = max(1, int(os.getenv("KIS_SUPPLY_MAX_RETRIES", "2")))
+PYKRX_REQUEST_TIMEOUT_SECONDS = float(os.getenv("PYKRX_REQUEST_TIMEOUT_SECONDS", "12"))
+PYKRX_OHLCV_MAX_RETRIES = max(1, int(os.getenv("PYKRX_OHLCV_MAX_RETRIES", "2")))
+PYKRX_OHLCV_RETRY_SLEEP_SECONDS = float(os.getenv("PYKRX_OHLCV_RETRY_SLEEP_SECONDS", "0.5"))
 KST = timezone(timedelta(hours=9))
 
 # config.py(같은 폴더)에서 KIS 토큰매니저/베이스URL 임포트 보장 (main.py 와 동일 패턴)
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 from config import create_token_manager, BASE_URL  # noqa: E402
+
+
+_ORIGINAL_REQUESTS_SESSION_REQUEST = requests.sessions.Session.request
+
+
+def _request_with_default_timeout(self, method, url, **kwargs):
+    """pykrx 내부 requests 호출이 무기한 대기하지 않도록 기본 timeout을 강제한다."""
+    kwargs.setdefault("timeout", PYKRX_REQUEST_TIMEOUT_SECONDS)
+    return _ORIGINAL_REQUESTS_SESSION_REQUEST(self, method, url, **kwargs)
+
+
+requests.sessions.Session.request = _request_with_default_timeout
 
 
 # ──────────────────────────────────────────────
@@ -173,7 +189,20 @@ def _fetch_raw_ohlcv(ticker: str, lookback_days: int, as_of=None) -> pd.DataFram
 
     end = (as_of or datetime.now(KST)).date()
     start = end - timedelta(days=lookback_days)
-    df = stock.get_market_ohlcv(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), ticker)
+    last_error: Exception | None = None
+    for attempt in range(1, PYKRX_OHLCV_MAX_RETRIES + 1):
+        try:
+            df = stock.get_market_ohlcv(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), ticker)
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < PYKRX_OHLCV_MAX_RETRIES:
+                time.sleep(PYKRX_OHLCV_RETRY_SLEEP_SECONDS * attempt)
+    else:
+        if last_error:
+            raise last_error
+        return None
+
     if df is None or df.empty:
         return None
 

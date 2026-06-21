@@ -41,6 +41,8 @@ const CANDIDATE_PROGRESS_STAGES = [
 ] as const;
 
 let activeRun: Promise<CandidateAnalysisRunResult> | null = null;
+type SpawnedProcess = ReturnType<typeof spawn>;
+let activeCandidateChild: SpawnedProcess | null = null;
 
 function boundedPercent(value: number): number {
   return Math.min(100, Math.max(0, Math.round(value)));
@@ -302,6 +304,7 @@ function runProcess(
   env: Record<string, string | undefined>,
   timeoutMs: number,
   onOutput?: (text: string) => void,
+  onChild?: (child: SpawnedProcess | null) => void,
 ): Promise<void> {
   return new Promise((resolveRun, rejectRun) => {
     const child = spawn(command, args, {
@@ -309,16 +312,24 @@ function runProcess(
       env,
       windowsHide: true,
     });
+    onChild?.(child);
     let stdout = "";
     let stderr = "";
     let settled = false;
 
-    const timer = globalThis.setTimeout(() => {
-      if (!settled) {
-        child.kill("SIGTERM");
-        settled = true;
-        rejectRun(new Error(`AI candidate analysis timed out after ${timeoutMs}ms.`));
+    const settle = (callback: () => void) => {
+      if (settled) {
+        return;
       }
+      settled = true;
+      globalThis.clearTimeout(timer);
+      onChild?.(null);
+      callback();
+    };
+
+    const timer = globalThis.setTimeout(() => {
+      child.kill("SIGTERM");
+      settle(() => rejectRun(new Error(`AI candidate analysis timed out after ${timeoutMs}ms.`)));
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {
@@ -342,28 +353,19 @@ function runProcess(
     });
 
     child.on("error", (error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      globalThis.clearTimeout(timer);
-      rejectRun(error);
+      settle(() => rejectRun(error));
     });
 
     child.on("close", (code) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      globalThis.clearTimeout(timer);
+      settle(() => {
+        if (code === 0) {
+          resolveRun();
+          return;
+        }
 
-      if (code === 0) {
-        resolveRun();
-        return;
-      }
-
-      const log = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
-      rejectRun(new Error(log || `AI candidate analysis exited with code ${code ?? "unknown"}.`));
+        const log = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
+        rejectRun(new Error(log || `AI candidate analysis exited with code ${code ?? "unknown"}.`));
+      });
     });
   });
 }
@@ -407,7 +409,9 @@ async function executeCandidateAnalysis(env = process.env): Promise<CandidateAna
     optionalNumericArg(args, "--supply-min-positive-days", env.PIPELINE_SUPPLY_MIN_POSITIVE_DAYS);
 
     updateCandidateAnalysisProgress(progressSnapshot(0, 8, "integrated_pipeline.py 실행을 시작했습니다."));
-    await runProcess(python, args, root, pipelineEnv(env), timeoutMs, recordCandidateAnalysisOutput);
+    await runProcess(python, args, root, pipelineEnv(env), timeoutMs, recordCandidateAnalysisOutput, (child) => {
+      activeCandidateChild = child;
+    });
 
     updateCandidateAnalysisProgress((current) => progressSnapshot(6, 95, "생성된 step2·step3 결과 파일을 검증하는 중입니다.", current));
     await requireFreshFile(top10CsvPath, "Transformer Top10 CSV", startedAt);
@@ -474,7 +478,7 @@ let runState: RunState = { status: "idle" };
 
 function candidateProgressStaleMs(): number {
   const parsed = Number(process.env.PIPELINE_PROGRESS_STALE_MS);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 10 * 60 * 1000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 3 * 60 * 1000;
 }
 
 function failStaleCandidateRunIfNeeded(): void {
@@ -490,6 +494,14 @@ function failStaleCandidateRunIfNeeded(): void {
   const failedAt = Date.now();
   const startedAt = runState.startedAt;
   const error = "AI 후보 분석 진행 로그가 오래 갱신되지 않았습니다. 파이프라인 상태를 확인한 뒤 다시 실행하세요.";
+  if (activeCandidateChild) {
+    try {
+      activeCandidateChild.kill("SIGTERM");
+    } catch {
+      // The process may have already exited; status cleanup still proceeds.
+    }
+  }
+  activeCandidateChild = null;
   runState = {
     error,
     finishedAt: failedAt,

@@ -1,10 +1,18 @@
 import type { StockQuote } from "../../types/trading";
 
 function formatWon(value: number) {
+  // A candidate whose live KIS quote hasn't arrived yet has price 0 — show an
+  // honest placeholder instead of a fake "0원".
+  if (!Number.isFinite(value) || value <= 0) {
+    return "—";
+  }
   return `${Math.round(value).toLocaleString("ko-KR")}원`;
 }
 
 function formatRate(value: number) {
+  if (!Number.isFinite(value) || value === 0) {
+    return "—";
+  }
   return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 

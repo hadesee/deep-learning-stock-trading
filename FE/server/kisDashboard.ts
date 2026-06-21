@@ -781,6 +781,68 @@ export async function buildKisIndices(env = process.env): Promise<MarketIndexSna
   return fetchIndexSnapshots(config, accessToken, env);
 }
 
+/**
+ * Batch quote endpoint for the AI candidate list. Fetches the requested codes
+ * SEQUENTIALLY (spaced by `requestDelayMs`, with the same rate-limit retry as the
+ * dashboard build) so a one-shot client call can hydrate ~10 candidates without
+ * firing concurrent KIS requests that trip the "초당 거래건수" limit. AI fields are
+ * merged per ticker; per-stock failures are skipped, not fatal.
+ */
+export async function buildKisStockQuotes(symbols: string[], env = process.env): Promise<StockQuote[]> {
+  const codes = Array.from(
+    new Set(
+      symbols
+        .map((symbol) => symbol.replace(/\D/g, "").slice(0, 6))
+        .filter((code) => /^\d{6}$/.test(code) && code !== "000000"),
+    ),
+  );
+  if (codes.length === 0) {
+    return [];
+  }
+
+  // Prefer the pre-warmed snapshot: it already holds real prices for the full
+  // KOSPI200, so most/all candidates resolve with ZERO extra KIS calls. Only the
+  // codes missing from it are fetched live (sequentially) below.
+  const snapshot = await readLastSnapshot();
+  const snapshotByCode = new Map((snapshot?.stocks ?? []).map((stock) => [stock.code, stock]));
+  const fromSnapshot: StockQuote[] = [];
+  const missing: string[] = [];
+  for (const code of codes) {
+    const hit = snapshotByCode.get(code);
+    if (hit && hit.currentPrice > 0) {
+      fromSnapshot.push(hit);
+    } else {
+      missing.push(code);
+    }
+  }
+
+  if (missing.length === 0) {
+    return fromSnapshot;
+  }
+
+  const config = getKisConfig(env);
+  const accessToken = await getAccessToken(config);
+  const pipelineRows = await loadPipelineRows();
+  const aiByTicker = pipelineRows ? indexPipelineByTicker(pipelineRows) : null;
+  const seeds = missing.map(findStockSeed);
+
+  const fetched = await mapSequential(seeds, config.requestDelayMs, async (seed) => {
+    try {
+      return await fetchStockQuote(config, accessToken, seed, {
+        aiRow: aiByTicker?.get(seed.code),
+        withInvestorFlow: env.KIS_QUOTE_WITH_INVESTOR_FLOW === "true",
+      });
+    } catch {
+      return null;
+    }
+  });
+
+  return [
+    ...fromSnapshot,
+    ...fetched.filter((quote): quote is StockQuote => quote !== null && quote.currentPrice > 0),
+  ];
+}
+
 /** Fast single-stock quote endpoint for detail headers. */
 export async function buildKisStockQuote(symbol: string, env = process.env): Promise<StockQuote> {
   const code = normalizeStockCode(symbol);

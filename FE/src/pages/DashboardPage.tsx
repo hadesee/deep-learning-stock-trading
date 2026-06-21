@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { MarketWorkspace } from "../components/market/MarketWorkspace";
 import { usePageTitle } from "../hooks/usePageTitle";
 import {
+  fetchCandidateQuotes,
   fetchMarketIndicesData,
   fetchMarketDashboardData,
   fetchPipelineCandidates,
@@ -12,11 +13,15 @@ import {
 } from "../services/tradingData";
 import { overlayLiveAnalysis } from "../data/pipelineAdapter";
 import type { CandidateAnalysisStatus } from "../services/tradingData";
-import type { MarketDashboardData, PipelineOutputRow } from "../types/trading";
+import type { MarketDashboardData, PipelineOutputRow, StockQuote } from "../types/trading";
 
 type AnalysisPhase = "idle" | "running" | "done";
 
 const ANALYSIS_CACHE_KEY = "kospi-dashboard-analysis.v1";
+
+/** Candidate price hydration: retry stragglers a few times to ride out KIS rate-limit contention. */
+const HYDRATE_MAX_ATTEMPTS = 3;
+const HYDRATE_RETRY_DELAY_MS = 2500;
 
 function elapsedLabel(startMs: number): string {
   return elapsedMsLabel(Date.now() - startMs);
@@ -128,6 +133,67 @@ export function DashboardPage() {
     return () => controller.abort();
   }, []);
 
+  // When restoring a cached analysis on mount, the overlay starts on the mock
+  // base (placeholder prices). Hydrate the candidate list with live KIS prices.
+  useEffect(() => {
+    if (!cachedRows || cachedRows.length === 0) {
+      return;
+    }
+
+    void hydrateCandidatePrices(cachedRows, analysisRunRef.current);
+    // Run once on mount for the restored rows.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * Replaces the candidate list's placeholder/mock prices with live KIS quotes.
+   * Fire-and-forget: the board renders immediately with placeholder prices, then
+   * re-renders with real prices once the KIS quote calls resolve. Guarded by
+   * `runId` so a newer run/refresh isn't clobbered by a late hydration.
+   */
+  async function hydrateCandidatePrices(rows: PipelineOutputRow[], runId: number): Promise<void> {
+    const codes = rows
+      .map((row) => String(row.result?.ticker ?? row.input_row?.ticker ?? "").replace(/\D/g, "").padStart(6, "0").slice(-6))
+      .filter((code) => /^\d{6}$/.test(code) && code !== "000000");
+    if (codes.length === 0) {
+      return;
+    }
+
+    // Accumulate across attempts. A straggler can fail on the first pass when the
+    // background snapshot warm is saturating the KIS rate limit; refetch only the
+    // still-missing codes (cheap, snapshot-first) so all candidates end up with a
+    // real price instead of getting stuck below the full count.
+    const merged = new Map<string, StockQuote>();
+    for (let attempt = 0; attempt < HYDRATE_MAX_ATTEMPTS; attempt += 1) {
+      const missing = codes.filter((code) => !merged.has(code));
+      if (missing.length === 0) {
+        break;
+      }
+
+      try {
+        const quotes = await fetchCandidateQuotes(missing);
+        if (analysisRunRef.current !== runId) {
+          return;
+        }
+        for (const [code, quote] of quotes) {
+          merged.set(code, quote);
+        }
+        if (quotes.size > 0) {
+          setData((base) => overlayLiveAnalysis(base, rows, merged));
+        }
+      } catch {
+        // Keep placeholder prices for this pass; a later attempt may succeed.
+      }
+
+      if (attempt < HYDRATE_MAX_ATTEMPTS - 1 && merged.size < codes.length) {
+        await new Promise((resolve) => setTimeout(resolve, HYDRATE_RETRY_DELAY_MS));
+        if (analysisRunRef.current !== runId) {
+          return;
+        }
+      }
+    }
+  }
+
   /** Loads the freshly generated outputs and reveals the board. Returns true on success. */
   async function revealResults(note: string): Promise<boolean> {
     const rows = await fetchPipelineCandidates(undefined, { fallbackToMock: false });
@@ -138,6 +204,7 @@ export function DashboardPage() {
     setData((base) => overlayLiveAnalysis(base, rows));
     setAnalysisMessage(note);
     setAnalysisPhase("done");
+    void hydrateCandidatePrices(rows, analysisRunRef.current);
     return true;
   }
 

@@ -31,8 +31,10 @@ _thread_local = local()
 def get_genai_client():
     client = getattr(_thread_local, "genai_client", None)
     if client is None:
-        # .env 파일에 있는 GEMINI_API_KEY를 자동으로 인식합니다.
-        client = genai.Client()
+        # .env 파일에 있는 GEMINI_API_KEY를 인식합니다. 설치된 google-genai SDK는
+        # GOOGLE_API_KEY만 자동 인식하므로 GEMINI_API_KEY를 명시적으로 넘겨줍니다.
+        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        client = genai.Client(api_key=api_key) if api_key else genai.Client()
         _thread_local.genai_client = client
     return client
 

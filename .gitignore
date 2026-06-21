@@ -1,10 +1,16 @@
 # 환경변수 / 시크릿 (절대 커밋 금지)
 .env
+.env.*
+!.env.example
 kis_token_cache.json
+.kis-token-cache.json
 
 # 파이썬 캐시
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
 
 # 실행 산출물
 outputs/
@@ -13,8 +19,17 @@ outputs/
 fresh_ohlcv.parquet
 
 # 가상환경 / OS
+.venv/
+venv/
+env/
 venv-timesfm/
 .DS_Store
+Thumbs.db
+
+# 에디터 / IDE
+.idea/
+.vscode/
+*.log
 
 # 주의: shared_*.parquet 은 재현성 위해 커밋 유지 → .gitignore에 넣지 않는다.
 # (과거 *.parquet 일괄 무시 규칙은 제거함)

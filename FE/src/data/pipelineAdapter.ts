@@ -83,45 +83,76 @@ export function rowToCandidate(row: PipelineOutputRow): AiCandidate {
 }
 
 /**
+ * Minimal StockQuote for an AI candidate whose KIS quote isn't available yet
+ * (missing from the base dashboard and not in the fetched quotes). Carries the
+ * real ticker/name from the pipeline row; price fields are 0 so the UI renders
+ * "—" until a live quote hydrates. Keeps the candidate visible instead of
+ * dropping it from the list.
+ */
+function placeholderQuote(code: string, row: PipelineOutputRow): StockQuote {
+  return {
+    code,
+    name: row.result?.company_name ?? String(row.input_row?.company_name ?? code),
+    market: "KOSPI",
+    isKospi200: true,
+    currentPrice: 0,
+    change: 0,
+    changeRate: 0,
+    direction: "flat",
+    accumulatedVolume: 0,
+    tradingValue: 0,
+    tradingValueRank: 0,
+    investorFlow: { foreign: 0, institution: 0, personal: 0 },
+    aiSummary: "",
+    sentimentLabel: row.result?.label ?? "NEUTRAL",
+    confidence: 0,
+    predictedReturn: null,
+    upProbability: null,
+    miniSeries: [],
+  };
+}
+
+/**
  * Overlays live pipeline analysis onto a base dashboard so the board reflects a
  * fresh run: matching tickers get the real sentiment/summary/confidence, and the
- * list keeps the backend's final score order. Prices stay from the base
- * (placeholder until the KIS bridge is connected).
+ * list keeps the backend's final score order.
+ *
+ * Prices come from real KIS quotes when a `quotes` map is supplied (keyed by
+ * 6-digit code, e.g. from {@link fetchCandidateQuotes}); otherwise they fall
+ * back to the base dashboard entry so the row still renders before quotes
+ * hydrate. A candidate with a live quote is shown even when the base dashboard
+ * (mock/cached) doesn't contain it.
  */
-export function overlayLiveAnalysis(base: MarketDashboardData, rows: PipelineOutputRow[]): MarketDashboardData {
-  const byTicker = new Map<string, PipelineOutputRow>();
-  const orderByTicker = new Map<string, number>();
+export function overlayLiveAnalysis(
+  base: MarketDashboardData,
+  rows: PipelineOutputRow[],
+  quotes?: Map<string, StockQuote>,
+): MarketDashboardData {
+  const baseByCode = new Map(base.stocks.map((stock) => [stock.code, stock]));
+  const seen = new Set<string>();
+  const stocks: StockQuote[] = [];
+
   for (const row of rows) {
     const code = String(row.result?.ticker ?? row.input_row?.ticker ?? "").padStart(6, "0");
-    if (code) {
-      byTicker.set(code, row);
-      if (!orderByTicker.has(code)) {
-        orderByTicker.set(code, orderByTicker.size);
-      }
+    if (!code || seen.has(code)) {
+      continue;
     }
+
+    // Prefer the real KIS quote (live price); fall back to the base entry, then to
+    // a price-less placeholder so an AI-selected candidate is NEVER dropped just
+    // because its quote hasn't hydrated yet (price renders as "—" until it does).
+    const source = quotes?.get(code) ?? baseByCode.get(code) ?? placeholderQuote(code, row);
+
+    seen.add(code);
+    const result = row.result;
+    stocks.push({
+      ...source,
+      aiSummary: result.summary || source.aiSummary,
+      sentimentLabel: result.label ?? source.sentimentLabel,
+      confidence: result.confidence || source.confidence,
+      upProbability: num(row.input_row?.p_up) || source.upProbability,
+    });
   }
-
-  const orderOf = (code: string) => {
-    return orderByTicker.get(code) ?? Number.MAX_SAFE_INTEGER;
-  };
-
-  const stocks: StockQuote[] = base.stocks
-    .filter((stock) => byTicker.has(stock.code))
-    .map((stock) => {
-      const row = byTicker.get(stock.code);
-      if (!row) {
-        return stock;
-      }
-      const result = row.result;
-      return {
-        ...stock,
-        aiSummary: result.summary || stock.aiSummary,
-        sentimentLabel: result.label ?? stock.sentimentLabel,
-        confidence: result.confidence || stock.confidence,
-        upProbability: num(row.input_row?.p_up) || stock.upProbability,
-      };
-    })
-    .sort((a, b) => orderOf(a.code) - orderOf(b.code));
 
   return {
     ...base,

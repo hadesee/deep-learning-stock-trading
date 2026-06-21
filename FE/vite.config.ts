@@ -1,6 +1,6 @@
 import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
-import { buildFreshKisDashboard, buildKisDashboard, buildKisIndices, buildKisStockChart, buildKisStockQuote, refreshDashboardSnapshot } from "./server/kisDashboard";
+import { buildFreshKisDashboard, buildKisDashboard, buildKisIndices, buildKisStockChart, buildKisStockQuote, buildKisStockQuotes, refreshDashboardSnapshot } from "./server/kisDashboard";
 import { getCandidatesPayload, getStockAnalysisPayload } from "./server/pipelineResults";
 import {
   getCandidateAnalysisStatus,
@@ -89,6 +89,14 @@ function kisApiPlugin(): Plugin {
         }
 
         return buildKisStockChart(symbol);
+      });
+      jsonRequestRoute(server, "/api/korean-market/quotes", "GET", (request) => {
+        const symbols = queryValue(request, "symbols") ?? queryValue(request, "codes");
+        if (!symbols) {
+          throw new Error("symbols query parameter is required.");
+        }
+
+        return buildKisStockQuotes(symbols.split(","));
       });
       jsonRequestRoute(server, "/api/korean-market/quote", "GET", (request) => {
         const symbol = queryValue(request, "symbol") ?? queryValue(request, "code");

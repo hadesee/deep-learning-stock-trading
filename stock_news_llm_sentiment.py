@@ -581,7 +581,8 @@ def run_pipeline(
     model: str = "gemini-2.5-flash",
     llm_sleep_sec: float = 0.3,
 ) -> None:
-    client = genai.Client()
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    client = genai.Client(api_key=api_key) if api_key else genai.Client()
 
     df = load_stock_output(input_path)
     df = add_ensemble_prediction_if_possible(df)
