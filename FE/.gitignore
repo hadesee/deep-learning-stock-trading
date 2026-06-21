@@ -1,0 +1,12 @@
+node_modules
+dist
+.vite
+*.tsbuildinfo
+.claude/
+.codex-remote-attachments/
+.env
+.env.local
+.kis-token-cache.json
+vite-kis.*.log
+vite-dev.*.log
+server/cache/

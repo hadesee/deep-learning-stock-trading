@@ -1,0 +1,20 @@
+# 코드에서 실제 import 하는 패키지 (Python 3.10+)
+# 아래 버전은 호환 검증된 권장 핀입니다. 본인 환경의 정확한 설치 버전으로
+# 맞추려면:  pip freeze 결과와 대조해 수정하세요.
+
+# --- 코어 (모델/백테스트) ---
+torch==2.3.1
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.4.2
+matplotlib==3.8.4
+
+# --- 데이터 / API ---
+pykrx==1.0.45
+requests==2.32.3
+python-dotenv==1.0.1
+
+# --- LLM 단계 (뉴스 근거 설명; 선택 실행) ---
+openai==1.30.1
+google-genai==0.3.0
+pydantic==2.7.1

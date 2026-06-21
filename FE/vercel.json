@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/korean-market/refresh.ts": { "maxDuration": 300 },
+    "api/korean-market/dashboard.ts": { "maxDuration": 60 }
+  },
+  "crons": [
+    { "path": "/api/korean-market/refresh", "schedule": "*/20 0-6 * * 1-5" }
+  ],
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/$1" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}

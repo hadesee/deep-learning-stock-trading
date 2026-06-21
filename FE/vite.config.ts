@@ -1,0 +1,176 @@
+import { defineConfig, loadEnv, type Plugin } from "vite";
+import react from "@vitejs/plugin-react";
+import { buildFreshKisDashboard, buildKisDashboard, buildKisIndices, buildKisStockChart, buildKisStockQuote, refreshDashboardSnapshot } from "./server/kisDashboard";
+import { getCandidatesPayload, getStockAnalysisPayload } from "./server/pipelineResults";
+import {
+  getCandidateAnalysisStatus,
+  getStockNewsAnalysisStatus,
+  startCandidateAnalysis,
+  startStockNewsAnalysis,
+} from "./server/pipelineRunner";
+
+declare const process: {
+  cwd: () => string;
+  env: Record<string, string | undefined>;
+};
+
+type DevRequest = { method?: string; url?: string };
+type DevResponse = { end: (body: string) => void; setHeader: (name: string, value: string) => void; statusCode: number };
+
+function writeJson(response: DevResponse, statusCode: number, payload: unknown) {
+  response.statusCode = statusCode;
+  response.setHeader("Content-Type", "application/json; charset=utf-8");
+  response.end(JSON.stringify(payload));
+}
+
+function jsonRoute(
+  server: { middlewares: { use: (path: string, handler: (request: unknown, response: DevResponse) => void) => void } },
+  path: string,
+  allowedMethod: string,
+  build: () => Promise<unknown>,
+) {
+  server.middlewares.use(path, async (request, response) => {
+    const method = (request as { method?: string }).method;
+
+    if (method !== allowedMethod) {
+      writeJson(response, 405, { error: "Method not allowed" });
+      return;
+    }
+
+    try {
+      writeJson(response, 200, await build());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : `${path} request failed.`;
+      writeJson(response, 502, { error: message });
+    }
+  });
+}
+
+function queryValue(request: DevRequest, key: string): string | undefined {
+  const url = new URL(request.url ?? "", "http://localhost");
+  return url.searchParams.get(key) ?? undefined;
+}
+
+function jsonRequestRoute(
+  server: { middlewares: { use: (path: string, handler: (request: unknown, response: DevResponse) => void) => void } },
+  path: string,
+  allowedMethod: string,
+  build: (request: DevRequest) => Promise<unknown>,
+) {
+  server.middlewares.use(path, async (request, response) => {
+    const typedRequest = request as DevRequest;
+
+    if (typedRequest.method !== allowedMethod) {
+      writeJson(response, 405, { error: "Method not allowed" });
+      return;
+    }
+
+    try {
+      writeJson(response, 200, await build(typedRequest));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : `${path} request failed.`;
+      writeJson(response, 502, { error: message });
+    }
+  });
+}
+
+function kisApiPlugin(): Plugin {
+  return {
+    configureServer(server) {
+      jsonRequestRoute(server, "/api/korean-market/dashboard", "GET", (request) =>
+        queryValue(request, "fresh") === "1" ? buildFreshKisDashboard() : buildKisDashboard(),
+      );
+      jsonRoute(server, "/api/korean-market/indices", "GET", () => buildKisIndices());
+      jsonRoute(server, "/api/korean-market/refresh", "POST", () => refreshDashboardSnapshot());
+      jsonRequestRoute(server, "/api/korean-market/stock-chart", "GET", (request) => {
+        const symbol = queryValue(request, "symbol") ?? queryValue(request, "code");
+        if (!symbol) {
+          throw new Error("symbol query parameter is required.");
+        }
+
+        return buildKisStockChart(symbol);
+      });
+      jsonRequestRoute(server, "/api/korean-market/quote", "GET", (request) => {
+        const symbol = queryValue(request, "symbol") ?? queryValue(request, "code");
+        if (!symbol) {
+          throw new Error("symbol query parameter is required.");
+        }
+
+        return buildKisStockQuote(symbol);
+      });
+      server.middlewares.use("/api/stock-analysis/run", async (request, response) => {
+        const typedRequest = request as DevRequest;
+        const ticker = queryValue(typedRequest, "ticker") ?? queryValue(typedRequest, "code");
+        if (!ticker) {
+          writeJson(response, 400, { error: "ticker query parameter is required." });
+          return;
+        }
+
+        try {
+          if (typedRequest.method === "POST") {
+            writeJson(response, 200, startStockNewsAnalysis(ticker));
+          } else if (typedRequest.method === "GET") {
+            writeJson(response, 200, getStockNewsAnalysisStatus(ticker));
+          } else {
+            writeJson(response, 405, { error: "Method not allowed" });
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Stock news analysis failed.";
+          writeJson(response, 502, { error: message });
+        }
+      });
+      jsonRequestRoute(server, "/api/stock-analysis", "GET", (request) => {
+        const ticker = queryValue(request, "ticker") ?? queryValue(request, "code");
+        if (!ticker) {
+          throw new Error("ticker query parameter is required.");
+        }
+
+        return getStockAnalysisPayload(ticker);
+      });
+      // The analysis runs for minutes, so the request must not block: POST kicks
+      // off (or re-attaches to) the background job and returns the current status
+      // immediately; GET polls it. Registered before "/api/candidates" so the
+      // prefix match resolves here first.
+      server.middlewares.use("/api/candidates/run", async (request, response) => {
+        const method = (request as { method?: string }).method;
+
+        try {
+          if (method === "POST") {
+            writeJson(response, 200, startCandidateAnalysis());
+          } else if (method === "GET") {
+            writeJson(response, 200, getCandidateAnalysisStatus());
+          } else {
+            writeJson(response, 405, { error: "Method not allowed" });
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "/api/candidates/run request failed.";
+          writeJson(response, 502, { error: message });
+        }
+      });
+      jsonRoute(server, "/api/candidates", "GET", () => getCandidatesPayload());
+    },
+    name: "kis-api",
+  };
+}
+
+export default defineConfig(({ mode }) => {
+  Object.assign(process.env, loadEnv(mode, process.cwd(), ""));
+
+  return {
+    plugins: [react(), kisApiPlugin()],
+    server: {
+      // Bind to all interfaces so the dev server is reachable over the LAN and
+      // through a tunnel (Cloudflare Tunnel / ngrok), not just on localhost.
+      host: true,
+      // Keep local development on one canonical port. If another dev server is
+      // already using it, fail fast instead of silently opening 5174/5175 and
+      // splitting API state across multiple Vite processes.
+      port: process.env.PORT ? Number(process.env.PORT) : 5173,
+      strictPort: true,
+      // Dev only: accept any Host header so dynamic tunnel domains
+      // (*.trycloudflare.com, *.ngrok-free.app) aren't rejected by Vite's
+      // host check. Does not affect production builds.
+      allowedHosts: true,
+    },
+  };
+});
