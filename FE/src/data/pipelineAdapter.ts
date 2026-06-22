@@ -10,6 +10,14 @@ function num(value: unknown): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function nullableNum(value: unknown): number | null {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return null;
+  }
+  const parsed = typeof value === "number" ? value : Number(String(value).trim());
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function pick(points: string[], regex: RegExp): number | null {
   for (const point of points) {
     const match = point.match(regex);
@@ -64,12 +72,15 @@ export function rowToCandidate(row: PipelineOutputRow): AiCandidate {
     pUp,
     baseDate: String(input.transformer_base_date ?? input.lstm_base_date ?? ""),
     ensemblePredReturn: num(input.ensemble_pred_return),
-    foreignNetBuy: num(input.foreign_net_buy_sum),
-    instNetBuy: num(input.inst_net_buy_sum),
-    totalSupplyNetBuy: num(input.total_supply_net_buy),
+    foreignNetBuy: nullableNum(input.foreign_net_buy_sum),
+    instNetBuy: nullableNum(input.inst_net_buy_sum),
+    totalSupplyNetBuy: nullableNum(input.total_supply_net_buy),
     foreignPositiveDays: Math.round(num(input.foreign_positive_days)),
     instPositiveDays: Math.round(num(input.inst_positive_days)),
     supplyWindow: Math.round(num(input.supply_window)) || 5,
+    supplyDataDays: Math.round(num(input.supply_data_days)),
+    supplyStatus: String(input.supply_status ?? ""),
+    supplyError: String(input.supply_error ?? ""),
     newsCount: news.length,
     newsOverallScore: newsScore ?? 0,
     newsSentimentTally: findTally(points),

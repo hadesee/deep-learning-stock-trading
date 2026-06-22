@@ -57,9 +57,10 @@ DEFAULT_TRANSFORMER_CKPT  = BASE_DIR / "transformer_5y.pt"
 DEFAULT_PREDICT_MODULE    = BASE_DIR / "predict.py"
 DEFAULT_OUTPUT_DIR        = BASE_DIR / "outputs"
 MIN_OHLCV_ROWS            = 60
-SUPPLY_REQUEST_SLEEP_SECONDS = float(os.getenv("KIS_SUPPLY_SLEEP_SECONDS", "0.3"))
+SUPPLY_REQUEST_SLEEP_SECONDS = float(os.getenv("KIS_SUPPLY_SLEEP_SECONDS", "1.1"))
 SUPPLY_REQUEST_TIMEOUT_SECONDS = float(os.getenv("KIS_SUPPLY_TIMEOUT_SECONDS", "5"))
-SUPPLY_MAX_RETRIES = max(1, int(os.getenv("KIS_SUPPLY_MAX_RETRIES", "2")))
+SUPPLY_MAX_RETRIES = max(1, int(os.getenv("KIS_SUPPLY_MAX_RETRIES", "4")))
+SUPPLY_RATE_LIMIT_BACKOFF_SECONDS = float(os.getenv("KIS_SUPPLY_RATE_LIMIT_BACKOFF_SECONDS", "2.0"))
 PYKRX_REQUEST_TIMEOUT_SECONDS = float(os.getenv("PYKRX_REQUEST_TIMEOUT_SECONDS", "12"))
 PYKRX_OHLCV_MAX_RETRIES = max(1, int(os.getenv("PYKRX_OHLCV_MAX_RETRIES", "2")))
 PYKRX_OHLCV_RETRY_SLEEP_SECONDS = float(os.getenv("PYKRX_OHLCV_RETRY_SLEEP_SECONDS", "0.5"))
@@ -302,6 +303,15 @@ def _fetch_supply_trend(
         snippet = " ".join((text or "").split())[:300]
         return f"HTTP {status_code}: {snippet or 'empty response'}"
 
+    def _is_rate_limited(message: str) -> bool:
+        normalized = message.lower()
+        return (
+            "초당 거래건수" in message
+            or "rate limit" in normalized
+            or "too many requests" in normalized
+            or "egw00201" in normalized
+        )
+
     backoffs = [min(8.0, 0.8 * (2 ** i)) for i in range(SUPPLY_MAX_RETRIES)]
     payload = None
     reason = ""
@@ -327,10 +337,18 @@ def _fetch_supply_trend(
                 break
             reason = _response_reason(resp.status_code, data, text)
 
-        if debug:
-            print(f"    [DEBUG {ticker}] 수급 조회 {attempt}/{SUPPLY_MAX_RETRIES} 실패: {reason}")
         if attempt < SUPPLY_MAX_RETRIES:
-            time.sleep(backoffs[attempt - 1])
+            retry_sleep = backoffs[attempt - 1]
+            if _is_rate_limited(reason):
+                retry_sleep = max(retry_sleep, SUPPLY_RATE_LIMIT_BACKOFF_SECONDS * attempt)
+            if debug:
+                print(
+                    f"    [DEBUG {ticker}] 수급 조회 {attempt}/{SUPPLY_MAX_RETRIES} 실패: "
+                    f"{reason} ({retry_sleep:.1f}초 후 재시도)"
+                )
+            time.sleep(retry_sleep)
+        elif debug:
+            print(f"    [DEBUG {ticker}] 수급 조회 {attempt}/{SUPPLY_MAX_RETRIES} 실패: {reason}")
 
     if payload is None:
         return _empty_supply_result(window, status="fetch_failed", error=reason)
@@ -696,7 +714,7 @@ def run_news_crawling_and_llm(
             print(f"    ... 외 {len(stocks) - 5}개")
         
         # 뉴스 크롤링 + LLM 분석 실행
-        print(f"\n  📰 뉴스 크롤링 + Gemini LLM 분석 시작...")
+        print("\n  [NEWS] 뉴스 크롤링 + Gemini LLM 분석 시작...")
         # 파라미터로 max_news 값을 명시적으로 전달
         analyzed_results = crolling_mod.run_stock_analysis_pipeline(stocks, max_news=max_news)
         
@@ -730,7 +748,7 @@ def run_news_crawling_and_llm(
             results_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
             print(f"  저장: {output_csv}")
             
-            print(f"\n  📊 분석 결과 요약:")
+            print("\n  [SUMMARY] 분석 결과 요약:")
             for _, row in results_df.iterrows():
                 print(f"    [{row['sentiment']}] {row['ticker']} {row['company_name']}: "
                       f"종합점수={row['impact_score']}, "

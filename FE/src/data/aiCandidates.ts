@@ -21,12 +21,15 @@ export type AiCandidate = {
   pUp: number;
   baseDate: string;
   ensemblePredReturn: number;
-  foreignNetBuy: number;
-  instNetBuy: number;
-  totalSupplyNetBuy: number;
+  foreignNetBuy: number | null;
+  instNetBuy: number | null;
+  totalSupplyNetBuy: number | null;
   foreignPositiveDays: number;
   instPositiveDays: number;
   supplyWindow: number;
+  supplyDataDays?: number;
+  supplyStatus?: string;
+  supplyError?: string;
   newsCount: number;
   newsOverallScore: number;
   newsSentimentTally: string;

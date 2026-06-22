@@ -505,7 +505,7 @@ export async function fetchStockAnalysis(
     if (import.meta.env.DEV) {
       console.warn(`Stock analysis API unavailable for ${normalized}.`, error);
     }
-    return null;
+    throw error;
   }
 }
 

@@ -18,6 +18,11 @@ type AnalysisPhase = "idle" | "restoring" | "running" | "done";
 
 const ANALYSIS_CACHE_KEY = "kospi-dashboard-analysis.v1";
 
+type CachedAnalysis = {
+  data: MarketDashboardData | null;
+  rows: PipelineOutputRow[];
+};
+
 /** Candidate price loading: retry stragglers a few times to ride out KIS rate-limit contention. */
 const HYDRATE_MAX_ATTEMPTS = 3;
 const HYDRATE_RETRY_DELAY_MS = 2500;
@@ -51,18 +56,41 @@ function looksLikeLiveRows(rows: PipelineOutputRow[]): boolean {
   return rows.some((row) => row.input_row && row.input_row.pred_rank !== undefined && row.input_row.pred_rank !== null);
 }
 
-function readCachedAnalysisRows(): PipelineOutputRow[] | null {
+function looksLikeDashboardData(value: unknown): value is MarketDashboardData {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<MarketDashboardData>;
+  return Array.isArray(candidate.indices) && Array.isArray(candidate.stocks) && Array.isArray(candidate.watchlist);
+}
+
+function readCachedAnalysis(): CachedAnalysis | null {
   try {
     const parsed = JSON.parse(window.sessionStorage.getItem(ANALYSIS_CACHE_KEY) ?? "null") as unknown;
-    return Array.isArray(parsed) && looksLikeLiveRows(parsed as PipelineOutputRow[]) ? (parsed as PipelineOutputRow[]) : null;
+    // Migrate the previous rows-only cache shape. It remains a network fallback,
+    // but cannot skip the first quote hydration because it has no rendered data.
+    if (Array.isArray(parsed)) {
+      return looksLikeLiveRows(parsed as PipelineOutputRow[]) ? { data: null, rows: parsed as PipelineOutputRow[] } : null;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    const cache = parsed as Partial<CachedAnalysis>;
+    if (!Array.isArray(cache.rows) || !looksLikeLiveRows(cache.rows as PipelineOutputRow[])) {
+      return null;
+    }
+    return {
+      data: looksLikeDashboardData(cache.data) ? cache.data : null,
+      rows: cache.rows as PipelineOutputRow[],
+    };
   } catch {
     return null;
   }
 }
 
-function writeCachedAnalysisRows(rows: PipelineOutputRow[]): void {
+function writeCachedAnalysis(rows: PipelineOutputRow[], data: MarketDashboardData | null): void {
   try {
-    window.sessionStorage.setItem(ANALYSIS_CACHE_KEY, JSON.stringify(rows));
+    window.sessionStorage.setItem(ANALYSIS_CACHE_KEY, JSON.stringify({ data, rows } satisfies CachedAnalysis));
   } catch {
     // Session storage is a convenience for back/forward navigation; rendering still works without it.
   }
@@ -79,18 +107,21 @@ function clearCachedAnalysisRows(): void {
 export function DashboardPage() {
   usePageTitle("실시간 대시보드");
 
-  const [cachedRows] = useState<PipelineOutputRow[] | null>(() => readCachedAnalysisRows());
-  const [data, setData] = useState<MarketDashboardData>(() => {
-    // Do not expose cached candidates until every row has a real quote. Rendering
-    // the overlay here creates price-less placeholder rows on the first paint.
-    return getMarketDashboardData();
-  });
+  const [cachedAnalysis] = useState<CachedAnalysis | null>(() => readCachedAnalysis());
+  const cachedRows = cachedAnalysis?.rows ?? null;
+  const cachedData = cachedAnalysis?.data ?? null;
+  const canRestoreImmediately = cachedRows !== null && cachedData !== null;
+  const [data, setData] = useState<MarketDashboardData>(() => cachedData ?? getMarketDashboardData());
   // Probe reusable server outputs before showing the empty analysis gate. This
   // avoids asking for a new paid API run when a completed output already exists.
-  const [analysisPhase, setAnalysisPhase] = useState<AnalysisPhase>("restoring");
-  const [isAnalysisRunning, setAnalysisRunning] = useState(true);
+  const [analysisPhase, setAnalysisPhase] = useState<AnalysisPhase>(canRestoreImmediately ? "done" : "restoring");
+  const [isAnalysisRunning, setAnalysisRunning] = useState(!canRestoreImmediately);
   const [analysisMessage, setAnalysisMessage] = useState<string | undefined>(
-    cachedRows ? `저장된 후보 ${cachedRows.length}종목을 복원하는 중입니다.` : "기존 AI 분석 산출물을 확인하는 중입니다.",
+    canRestoreImmediately
+      ? `기존 분석 산출물 재사용 · 후보 ${cachedRows.length}종목`
+      : cachedRows
+        ? `저장된 후보 ${cachedRows.length}종목을 복원하는 중입니다.`
+        : "기존 AI 분석 산출물을 확인하는 중입니다.",
   );
   const [analysisErrorMessage, setAnalysisErrorMessage] = useState<string | undefined>();
   const [analysisStatus, setAnalysisStatus] = useState<CandidateAnalysisStatus | undefined>();
@@ -138,10 +169,24 @@ export function DashboardPage() {
         return;
       }
       if (rows.length === 0 || !looksLikeLiveRows(rows)) {
+        // A successful empty response is authoritative: outputs were removed or
+        // no completed run exists. Do not keep showing stale session candidates.
+        // Network failures take the catch path above and may still reuse cache.
         analysisRowsRef.current = null;
         clearCachedAnalysisRows();
+        setData(getMarketDashboardData());
         setAnalysisMessage(undefined);
         setAnalysisPhase("idle");
+        return;
+      }
+
+      // Back/forward navigation already has a complete rows+quotes snapshot.
+      // Keep it visible and skip another KIS quote hydration when the server is
+      // serving the same analysis payload. A genuinely newer output is updated
+      // in the background without replacing the board with a loading gate.
+      if (canRestoreImmediately && JSON.stringify(rows) === JSON.stringify(cachedRows)) {
+        analysisRowsRef.current = rows;
+        writeCachedAnalysis(rows, cachedData);
         return;
       }
 
@@ -237,7 +282,6 @@ export function DashboardPage() {
   ): Promise<boolean> {
     const runId = analysisRunRef.current;
     analysisRowsRef.current = rows;
-    writeCachedAnalysisRows(rows);
     setAnalysisMessage(`AI 분석 완료 · 후보 ${rows.length}종목의 현재가를 확인하는 중입니다.`);
 
     const quotes = await loadCompleteCandidateQuotes(rows, runId);
@@ -245,7 +289,11 @@ export function DashboardPage() {
       return false;
     }
 
-    setData((base) => overlayLiveAnalysis(baseData ?? base, rows, quotes));
+    setData((base) => {
+      const next = overlayLiveAnalysis(baseData ?? base, rows, quotes);
+      writeCachedAnalysis(rows, next);
+      return next;
+    });
     setAnalysisMessage(note);
     setAnalysisPhase("done");
     return true;

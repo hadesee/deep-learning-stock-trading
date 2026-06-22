@@ -9,7 +9,6 @@ import {
   readWatchlistCodes,
   writeWatchlistCodes,
 } from "../services/tradingData";
-import { getAiCandidate } from "../data/aiCandidates";
 import type { AiCandidate, AiNews } from "../data/aiCandidates";
 import { rowToCandidate } from "../data/pipelineAdapter";
 import type { MarketDirection, StockQuote } from "../types/trading";
@@ -250,10 +249,18 @@ function EvidenceReportDashboard({ candidate }: { candidate: AiCandidate }) {
   const neutralPct = total > 0 ? (neutralCount / total) * 100 : 0;
   const negativePct = total > 0 ? (parsed.negative / total) * 100 : 0;
   const tone = sentimentTone(candidate.finalSentiment);
-  const supplyMaxAbs = Math.max(Math.abs(candidate.foreignNetBuy), Math.abs(candidate.instNetBuy), Math.abs(candidate.totalSupplyNetBuy), 1);
+  const hasSupplyData =
+    candidate.foreignNetBuy !== null && candidate.instNetBuy !== null && candidate.totalSupplyNetBuy !== null;
+  const foreignNetBuy = candidate.foreignNetBuy ?? 0;
+  const instNetBuy = candidate.instNetBuy ?? 0;
+  const totalSupplyNetBuy = candidate.totalSupplyNetBuy ?? 0;
+  const supplyMaxAbs = Math.max(Math.abs(foreignNetBuy), Math.abs(instNetBuy), Math.abs(totalSupplyNetBuy), 1);
   const supplyDays = candidate.foreignPositiveDays + candidate.instPositiveDays;
   const supplyDayTotal = Math.max(candidate.supplyWindow * 2, 1);
-  const supplyParticipationScore = clampPercent((supplyDays / supplyDayTotal) * 100);
+  const supplyParticipationScore = hasSupplyData ? clampPercent((supplyDays / supplyDayTotal) * 100) : null;
+  const supplyUnavailableLabel = candidate.supplyError?.includes("초당 거래건수")
+    ? "KIS 요청 제한 초과"
+    : "수급 데이터 없음";
   const signalBars = [
     {
       label: "Transformer",
@@ -268,7 +275,7 @@ function EvidenceReportDashboard({ candidate }: { candidate: AiCandidate }) {
     {
       label: "수급",
       value: supplyParticipationScore,
-      tone: candidate.totalSupplyNetBuy >= 0 ? "up" : "down",
+      tone: !hasSupplyData ? "neutral" : totalSupplyNetBuy >= 0 ? "up" : "down",
     },
     {
       label: "최종",
@@ -312,9 +319,9 @@ function EvidenceReportDashboard({ candidate }: { candidate: AiCandidate }) {
         <ReportKpiCard
           icon="F"
           label="수급 합산"
-          value={formatEok(candidate.totalSupplyNetBuy)}
-          sub={`매수 우위 ${supplyDays}/${supplyDayTotal}일`}
-          tone={candidate.totalSupplyNetBuy >= 0 ? "is-positive-text" : "is-negative-text"}
+          value={hasSupplyData ? formatEok(totalSupplyNetBuy) : "조회 실패"}
+          sub={hasSupplyData ? `매수 우위 ${supplyDays}/${supplyDayTotal}일` : supplyUnavailableLabel}
+          tone={hasSupplyData ? (totalSupplyNetBuy >= 0 ? "is-positive-text" : "is-negative-text") : undefined}
         />
       </div>
 
@@ -356,9 +363,12 @@ function EvidenceReportDashboard({ candidate }: { candidate: AiCandidate }) {
               <div className="report-bar" key={bar.label}>
                 <span>{bar.label}</span>
                 <div className="report-bar__track">
-                  <i className={`report-bar__fill report-bar__fill--${bar.tone}`} style={{ width: `${Math.max(4, clampPercent(bar.value))}%` }} />
+                  <i
+                    className={`report-bar__fill report-bar__fill--${bar.tone}`}
+                    style={{ width: `${bar.value === null ? 0 : Math.max(4, clampPercent(bar.value))}%` }}
+                  />
                 </div>
-                <strong>{Math.round(bar.value)}</strong>
+                <strong>{bar.value === null ? "—" : Math.round(bar.value)}</strong>
               </div>
             ))}
           </div>
@@ -369,15 +379,15 @@ function EvidenceReportDashboard({ candidate }: { candidate: AiCandidate }) {
         <div className="report-supply-panel__summary">
           <MetricTile
             label="외국인+기관 합산"
-            value={formatEok(candidate.totalSupplyNetBuy)}
-            sub="최근 누적 순매수 금액"
-            tone={candidate.totalSupplyNetBuy >= 0 ? "is-positive-text" : "is-negative-text"}
+            value={hasSupplyData ? formatEok(totalSupplyNetBuy) : "조회 실패"}
+            sub={hasSupplyData ? "최근 누적 순매수 금액" : supplyUnavailableLabel}
+            tone={hasSupplyData ? (totalSupplyNetBuy >= 0 ? "is-positive-text" : "is-negative-text") : undefined}
           />
           <MetricTile
             label="매수 우위 일수"
-            value={`${supplyDays}/${supplyDayTotal}일`}
-            sub="외국인·기관 합산 관찰"
-            tone={supplyDays >= supplyDayTotal / 2 ? "is-positive-text" : "is-negative-text"}
+            value={hasSupplyData ? `${supplyDays}/${supplyDayTotal}일` : "—"}
+            sub={hasSupplyData ? "외국인·기관 합산 관찰" : "조회 성공 후 표시"}
+            tone={hasSupplyData ? (supplyDays >= supplyDayTotal / 2 ? "is-positive-text" : "is-negative-text") : undefined}
           />
         </div>
         <div className="supply-grid">
@@ -412,21 +422,23 @@ function SupplyRow({
   label: string;
   maxAbs: number;
   window: number;
-  won: number;
+  won: number | null;
 }) {
-  const tone = won >= 0 ? "is-positive-text" : "is-negative-text";
-  const amountFill = maxAbs > 0 ? Math.max(8, Math.min(100, (Math.abs(won) / maxAbs) * 100)) : 0;
-  const dayFill = clampPercent((days / Math.max(window, 1)) * 100);
+  const hasData = won !== null;
+  const amount = won ?? 0;
+  const tone = !hasData ? "" : amount >= 0 ? "is-positive-text" : "is-negative-text";
+  const amountFill = hasData && maxAbs > 0 ? Math.max(8, Math.min(100, (Math.abs(amount) / maxAbs) * 100)) : 0;
+  const dayFill = hasData ? clampPercent((days / Math.max(window, 1)) * 100) : 0;
   return (
     <div className="supply-row">
       <span className="supply-row__label">{label}</span>
       <div className="supply-row__bar">
-        <i className={won >= 0 ? "is-positive" : "is-negative"} style={{ width: `${amountFill}%` }} />
+        <i className={amount >= 0 ? "is-positive" : "is-negative"} style={{ width: `${amountFill}%` }} />
       </div>
-      <strong className={`supply-row__won ${tone}`}>{formatEok(won)}</strong>
-      <small className="supply-row__days">매수 우위 {days}/{window}일</small>
+      <strong className={`supply-row__won ${tone}`}>{hasData ? formatEok(amount) : "—"}</strong>
+      <small className="supply-row__days">{hasData ? `매수 우위 ${days}/${window}일` : "조회 실패"}</small>
       <div className="supply-row__daysbar" aria-hidden="true">
-        <i style={{ width: `${Math.max(dayFill, 4)}%` }} />
+        <i style={{ width: `${hasData ? Math.max(dayFill, 4) : 0}%` }} />
       </div>
     </div>
   );
@@ -527,10 +539,10 @@ export function StockDetailPage() {
   const [liveStock, setLiveStock] = useState<StockQuote | undefined>();
   const stock = liveStock ?? dashboardStock;
 
-  // Bundled output shows instantly; the live pipeline result (after a real run)
-  // overrides it once fetched.
-  const [candidate, setCandidate] = useState<AiCandidate | undefined>(() => getAiCandidate(normalized));
-  const [isSyncing, setSyncing] = useState(false);
+  // The outputs-backed API is authoritative. Bundled generated candidates must
+  // not survive after outputs/ has been intentionally removed.
+  const [candidate, setCandidate] = useState<AiCandidate | undefined>();
+  const [isSyncing, setSyncing] = useState(true);
   const [isLive, setIsLive] = useState(false);
 
   useEffect(() => {
@@ -539,10 +551,11 @@ export function StockDetailPage() {
     setSyncing(true);
     fetchStockAnalysis(normalized, controller.signal)
       .then((row) => {
-        if (active && row) {
-          setCandidate(rowToCandidate(row));
-          setIsLive(true);
+        if (!active) {
+          return;
         }
+        setCandidate(row ? rowToCandidate(row) : undefined);
+        setIsLive(Boolean(row));
       })
       .catch(() => {})
       .finally(() => {

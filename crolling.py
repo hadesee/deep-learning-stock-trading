@@ -253,7 +253,7 @@ def analyze_stock_with_llm(ticker: str, news_list: list[dict], tech_data_map: di
 
 
 def run_stock_analysis_pipeline(stocks_list: list, max_news: int = 8, llm_concurrency: int | None = None):
-    print("📰 1단계: 네이버 뉴스 크롤링 시작...")
+    print("[NEWS] 1단계: 네이버 뉴스 크롤링 시작...")
     
     # 💡 추가: 종목코드별 기술적 지표 데이터를 매핑해두기
     tech_data_map = {str(s.get("ticker", "")).zfill(6): s.get("tech_data", {}) for s in stocks_list}
@@ -268,7 +268,7 @@ def run_stock_analysis_pipeline(stocks_list: list, max_news: int = 8, llm_concur
     final_results = {}
     llm_workers = min(resolve_llm_concurrency(llm_concurrency), max(1, len(crawled_data)))
 
-    print(f"\n🤖 2단계: Gemini API 종목 단위 종합 분석 시작... (동시 {llm_workers}개)")
+    print(f"\n[LLM] 2단계: Gemini API 종목 단위 종합 분석 시작... (동시 {llm_workers}개)")
     completed_results = {}
     with ThreadPoolExecutor(max_workers=llm_workers) as executor:
         futures = {
